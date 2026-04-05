@@ -3,7 +3,7 @@ from schema import Col
 from pipeline import run_pipeline
 
 # 1. Load your raw bank statement
-my_data = pd.read_csv("my_bank_export.csv")
+my_data = pd.read_csv("path/my_bank_export.csv")
 
 # 2. Map your columns to the strict Schema
 my_data = my_data.rename(columns={

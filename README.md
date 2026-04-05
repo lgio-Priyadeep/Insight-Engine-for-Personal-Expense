@@ -4,8 +4,9 @@
 
 **1. Create a virtual environment:**
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv 
+source venv/bin/activate  # Linux
+./venv/Scripts/Activate.ps1 # Windows
 ```
 
 **2. Install dependencies:**
