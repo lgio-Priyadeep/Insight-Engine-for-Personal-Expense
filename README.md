@@ -37,4 +37,3 @@ pytest tests/
 ```
 
 ---
-# Insight-Engine-for-Personal-Expense

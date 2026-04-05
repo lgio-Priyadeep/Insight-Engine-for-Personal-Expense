@@ -1,0 +1,27 @@
+# Code Review Graph (MCP/local database and html output)
+.code-review-graph/
+
+# Python Virtual Environments & Caches
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+catboost_info/
+
+# Local Model Weights (Should not be in Git to save space)
+models/
+
+# Test data (Optional, but usually excluded to protect privacy limits unless explicitly shared)
+test-data/
+
+
+.agents/
+.claude/
+.vscode/
+.mcp.json
+.opencode.json
+.windsurfrules
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
