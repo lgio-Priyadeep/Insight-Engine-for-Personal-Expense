@@ -101,18 +101,16 @@ def predict_expected_spend(
     """
     df = df.copy()
 
-    # Fill NaNs defensively if needed before prediction
-    df_pred = df.copy()
-    fill_vars = [
+    # Build prediction-safe input without a full copy — fill NaN only on
+    # the columns the model actually reads.
+    pred_cols = [
         Col.IS_WEEKEND, Col.MONTH_SIN, Col.MONTH_COS, Col.DOW_SIN, Col.DOW_COS,
         Col.WEEK_OF_MONTH, Col.ROLLING_7D_MEAN, Col.ROLLING_30D_MEAN, Col.ROLLING_7D_STD
     ]
-    for col in fill_vars:
-        if col in df_pred.columns:
-            df_pred[col] = df_pred[col].fillna(0.0)
-    
-    if Col.PREDICTED_CATEGORY in df_pred.columns:
-        df_pred[Col.PREDICTED_CATEGORY] = df_pred[Col.PREDICTED_CATEGORY].fillna("uncategorized")
+    df_pred = df[pred_cols + [Col.PREDICTED_CATEGORY]].copy()
+    for col in pred_cols:
+        df_pred[col] = df_pred[col].fillna(0.0)
+    df_pred[Col.PREDICTED_CATEGORY] = df_pred[Col.PREDICTED_CATEGORY].fillna("uncategorized")
 
     # Predict expected amount
     df[Col.EXPECTED_AMOUNT] = pipeline.predict(df_pred)
@@ -120,9 +118,17 @@ def predict_expected_spend(
     # Calculate residual as actual minus predicted
     if Col.AMOUNT in df.columns:
         df[Col.RESIDUAL] = df[Col.AMOUNT] - df[Col.EXPECTED_AMOUNT]
-        # percent deviation: (residual / expected)
-        # using a small epsilon to prevent division by zero
-        eps = 1e-5
-        df[Col.PERCENT_DEVIATION] = df[Col.RESIDUAL] / (df[Col.EXPECTED_AMOUNT] + eps)
+        # percent deviation: residual / |expected|
+        # Using abs() + clip(lower=1.0) to prevent:
+        #   1. Division by zero when expected ≈ 0
+        #   2. Sign inversion when expected < 0 (possible with RidgeCV extrapolation)
+        safe_expected = df[Col.EXPECTED_AMOUNT].abs().clip(lower=1.0)
+        clipped_count = (df[Col.EXPECTED_AMOUNT].abs() < 1.0).sum()
+        if clipped_count:
+            logger.warning(
+                f"{clipped_count} row(s) had |expected_amount| < 1.0; "
+                "clipped to 1.0 for percent_deviation computation."
+            )
+        df[Col.PERCENT_DEVIATION] = df[Col.RESIDUAL] / safe_expected
 
     return df

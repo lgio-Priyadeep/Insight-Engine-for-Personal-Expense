@@ -26,6 +26,7 @@ from config import (
     CATEGORY_PRIORITY,
     INSIGHT_TYPES,
     TIP_CORPUS,
+    lookup_matching_tip_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,25 +42,11 @@ def _find_best_tip(category: str, insight_type: str) -> str:
     """
     Deterministically select the best tip_id for a (category, insight_type) pair.
 
-    Priority:
-      1. Category-specific tip matching the insight type
-      2. Generic tip matching the insight type
-      3. "no_tip" if nothing matches
-
-    Returns:
-        tip_id string.
+    Uses the shared ``lookup_matching_tip_ids`` helper. Returns the first
+    matching tip_id, or "no_tip" if nothing matches.
     """
-    # First pass: category-specific match
-    for tip_id, tip in TIP_CORPUS.items():
-        if category in tip["categories"] and insight_type in tip["insights"]:
-            return tip_id
-
-    # Second pass: generic match (empty categories list)
-    for tip_id, tip in TIP_CORPUS.items():
-        if len(tip["categories"]) == 0 and insight_type in tip["insights"]:
-            return tip_id
-
-    return "no_tip"
+    tip_ids = lookup_matching_tip_ids(category, insight_type)
+    return tip_ids[0] if tip_ids else "no_tip"
 
 
 def _generate_base_features(n: int, rng: np.random.Generator) -> pd.DataFrame:

@@ -125,7 +125,7 @@ def test_run_e2e_test():
     assert not spike_candidates.empty, "Failed to identify the $2500 transaction."
     assert spike_candidates.iloc[0]["is_anomaly"], "E2E BUG: The $2500 spike was NOT flagged as an anomaly!"
 
-    recurring_df = find_recurring_transactions(anomaly_df, group_col="cleaned_remarks", amount_tolerance=0.06)
+    recurring_df = find_recurring_transactions(anomaly_df, group_col="cleaned_remarks")
     
     # Assert subscription was found (Netflix ~15.99 x 3 across 90 days)
     netflix_candidates = recurring_df[recurring_df["cleaned_remarks"].str.contains("netflix", na=False)]
@@ -139,6 +139,97 @@ def test_run_e2e_test():
         print(f"INSIGHT: {string}")
         
     logger.info("E2E Pipeline execution completely successful!")
+
+def test_run_inference_uses_history_features():
+    """
+    Verifies that run_inference carries history-aware rolling features
+    through the full pipeline rather than discarding them.
+
+    Strategy:
+        1. Build a baseline PipelineResult via run_pipeline (90 days history)
+        2. Create a new transaction that looks like a continuation
+        3. Run run_inference with history
+        4. Run run_pipeline on the same new transaction WITHOUT history
+        5. Assert rolling features DIFFER — proving history was stitched
+    """
+    from pipeline import run_pipeline, run_inference
+    from schema import Col
+
+    # Build 90-day history
+    base_date = datetime(2023, 1, 1)
+    dates, amounts, flags, remarks = [], [], [], []
+    for i in range(90):
+        current_date = base_date + timedelta(days=i)
+        if current_date.weekday() == 5:
+            dates.append(current_date)
+            amounts.append(50.0 + np.random.uniform(-5, 5))
+            flags.append("dr")
+            remarks.append("Visa txn at Zomato POS")
+        if current_date.day == 15:
+            dates.append(current_date)
+            amounts.append(15.99)
+            flags.append("DR")
+            remarks.append("NETFLIX.COM SUBSCRIPTION")
+
+    history_df = pd.DataFrame({
+        "date": dates, "amount": amounts,
+        "amount_flag": flags, "remarks": remarks,
+    })
+
+    # 1. Baseline: run full pipeline on history
+    baseline_result = run_pipeline(history_df)
+    assert baseline_result.debits is not None
+    assert len(baseline_result.debits) > 0
+
+    # 2. New transaction: a future Zomato purchase
+    new_txn = pd.DataFrame({
+        "date": [datetime(2023, 4, 5)],
+        "amount": [55.0],
+        "amount_flag": ["DR"],
+        "remarks": ["Visa txn at Zomato POS"],
+    })
+
+    from model_state import InsightModelState
+    state = InsightModelState(
+        pipeline_version="1.0.0",
+        cat_pipeline=baseline_result.cat_pipeline,
+        spend_pipeline=baseline_result.spend_pipeline,
+        ranker_pipeline=baseline_result.ranker_pipeline,
+        global_mean=baseline_result.global_mean,
+        global_std=baseline_result.global_std,
+    )
+
+    # 3. Inference WITH history
+    infer_result = run_inference(new_txn, state, history_df=baseline_result.debits)
+    assert len(infer_result.debits) == 1, "Inference should return exactly the new transaction"
+
+    infer_debits = infer_result.debits
+    assert Col.ROLLING_7D_MEAN in infer_debits.columns
+    assert Col.ROLLING_30D_MEAN in infer_debits.columns
+    assert Col.EXPECTED_AMOUNT in infer_debits.columns
+    assert Col.PREDICTED_CATEGORY in infer_debits.columns
+
+    # 4. Verify history was actually used:
+    # With 90 days of Zomato history (~₹50/txn), the rolling_7d_mean should
+    # reflect the historical Zomato spend pattern, NOT the global fallback.
+    infer_rolling = infer_debits[Col.ROLLING_7D_MEAN].iloc[0]
+    global_mean_fallback = baseline_result.global_mean
+
+    # The global mean covers ALL transaction types (Zomato + Netflix) at
+    # varying amounts. The rolling_7d_mean for a Zomato-specific window
+    # should be different from this global average.
+    assert infer_rolling != global_mean_fallback, (
+        f"History-aware rolling mean ({infer_rolling}) should differ from "
+        f"global mean fallback ({global_mean_fallback}). "
+        "run_inference is not using history features."
+    )
+
+    # The history-aware rolling mean should be positive and close to the
+    # Zomato baseline (~₹50) since that's the dominant recent pattern.
+    assert infer_rolling > 0, "Rolling mean with history should be positive"
+
+    logger.info("run_inference history-aware test passed!")
+
 
 if __name__ == "__main__":
     test_run_e2e_test()

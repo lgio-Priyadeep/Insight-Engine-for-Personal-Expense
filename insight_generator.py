@@ -5,61 +5,75 @@ Reads flags generated across the ML Insight Engine and packages them
 into human-understandable spending optimization strings.
 
 Tips are sourced from TIP_CORPUS in config.py — no hardcoded tip text.
+
+Reproducibility:
+    All random selections use a seeded random.Random() instance.
+    Identical inputs + identical seed → identical outputs.
 """
 
 import logging
-import random
-from typing import List
+import random as _random_module
+from typing import List, Optional
 
 import pandas as pd
 
-from config import TIP_CORPUS, INSIGHT_TEMPLATES
+from config import TIP_CORPUS, INSIGHT_TEMPLATES, lookup_matching_tip_ids
 from schema import Col, require_columns
 
 logger = logging.getLogger(__name__)
 
 
-def _select_tip(category: str, insight_type: str) -> str:
+def _select_tip(
+    category: str,
+    insight_type: str,
+    rng: Optional[_random_module.Random] = None,
+) -> str:
     """
-    Select the best tip for a (category, insight_type) pair from TIP_CORPUS.
+    Select a tip text for a (category, insight_type) pair from TIP_CORPUS.
 
-    Priority:
-      1. Category-specific tip matching the insight type
-      2. Generic tip matching the insight type (empty categories list)
-      3. Empty string if no match
+    Uses the shared ``lookup_matching_tip_ids`` helper for the 2-pass
+    category-specific → generic lookup, then randomly selects from
+    matching tip texts.
+
+    Args:
+        category:     Transaction category (e.g. "food").
+        insight_type: Insight class (e.g. "spending_spike").
+        rng:          Seeded random.Random instance for deterministic selection.
+                      If None, creates one with default seed 42.
 
     Returns:
-        Tip text string.
+        Tip text string, or empty string if no match.
     """
-    # First pass: category-specific match
-    candidates = []
-    for tip_id, tip in TIP_CORPUS.items():
-        if category in tip["categories"] and insight_type in tip["insights"]:
-            candidates.append(tip["text"])
+    if rng is None:
+        rng = _random_module.Random(42)
 
-    if candidates:
-        return random.choice(candidates)
-
-    # Second pass: generic match (empty categories list)
-    for tip_id, tip in TIP_CORPUS.items():
-        if len(tip["categories"]) == 0 and insight_type in tip["insights"]:
-            candidates.append(tip["text"])
-
-    if candidates:
-        return random.choice(candidates)
-
-    return ""
+    tip_ids = lookup_matching_tip_ids(category, insight_type)
+    if not tip_ids:
+        return ""
+    texts = [TIP_CORPUS[tid]["text"] for tid in tip_ids]
+    return rng.choice(texts)
 
 
-def generate_human_insights(df: pd.DataFrame, top_n: int = 10) -> List[str]:
+def generate_human_insights(
+    df: pd.DataFrame,
+    top_n: int = 10,
+    seed: int = 42,
+) -> List[str]:
     """
     Parses a fully contextualized DataFrame to yield simple string
     summaries representing anomalous and recurring transaction signals,
     ranked by the LightGBM Insight Ranker.
 
     Tips are selected from the curated TIP_CORPUS in config.py.
+
+    Args:
+        df:    Fully enriched DataFrame from the pipeline.
+        top_n: Maximum number of insight strings to return.
+        seed:  Random seed for deterministic tip/template selection.
+               Same seed + same data → identical output.
     """
     logger.info("Generating NLP insights...")
+    rng = _random_module.Random(seed)
 
     require_columns(df, Col.insight_generator_input(), "insight_generator")
     
@@ -86,7 +100,7 @@ def generate_human_insights(df: pd.DataFrame, top_n: int = 10) -> List[str]:
             # Select a template from INSIGHT_TEMPLATES
             templates = INSIGHT_TEMPLATES.get("subscription", [])
             if templates:
-                template = random.choice(templates)
+                template = rng.choice(templates)
                 insight_text = template.format(
                     merchant=name.title(),
                     amount=amt,
@@ -98,7 +112,7 @@ def generate_human_insights(df: pd.DataFrame, top_n: int = 10) -> List[str]:
                     f"charged {freq} for roughly ₹{amt:.2f}."
                 )
 
-            tip = _select_tip("", "subscription")
+            tip = _select_tip("", "subscription", rng=rng)
             candidates.append((score, "subscription", insight_text, tip))
 
     # 2. Extract Anomalies
@@ -116,7 +130,7 @@ def generate_human_insights(df: pd.DataFrame, top_n: int = 10) -> List[str]:
             # Select a template from INSIGHT_TEMPLATES
             templates = INSIGHT_TEMPLATES.get("spending_spike", [])
             if templates:
-                template = random.choice(templates)
+                template = rng.choice(templates)
                 insight_text = template.format(
                     category=cat,
                     merchant=name,
@@ -130,7 +144,7 @@ def generate_human_insights(df: pd.DataFrame, top_n: int = 10) -> List[str]:
                     f"This is {pct:.1f}% above your normal expected baseline."
                 )
 
-            tip = _select_tip(cat, "spending_spike")
+            tip = _select_tip(cat, "spending_spike", rng=rng)
             candidates.append((score, "spike", insight_text, tip))
 
     # 3. Diversity Ranking logic

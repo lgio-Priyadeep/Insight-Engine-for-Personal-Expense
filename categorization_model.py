@@ -121,6 +121,6 @@ def predict_categories(
     confidences = probs.max(axis=1)
 
     df[Col.PREDICTED_CATEGORY] = preds
-    df["category_confidence"] = confidences
+    df[Col.CATEGORY_CONFIDENCE] = confidences
 
     return df

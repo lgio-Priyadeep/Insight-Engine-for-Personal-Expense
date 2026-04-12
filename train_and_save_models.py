@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from training_data_generator import generate_insight_dataset
+from insight_model import _compute_checksum
 from schema import Col
 
 logging.basicConfig(level=logging.INFO)
@@ -63,8 +64,18 @@ def train_and_save():
     
     with open(model_path, "wb") as f:
         pickle.dump(pipeline, f)
-        
-    logger.info(f"Model saved successfully to {model_path} ({os.path.getsize(model_path) / 1024:.1f} KB)")
+    
+    # Security: write SHA-256 checksum for integrity verification on load
+    checksum = _compute_checksum(model_path)
+    checksum_path = model_path + ".sha256"
+    with open(checksum_path, "w") as f:
+        f.write(checksum)
+    
+    logger.info(
+        f"Model saved successfully to {model_path} "
+        f"({os.path.getsize(model_path) / 1024:.1f} KB) "
+        f"SHA-256: {checksum}"
+    )
 
 if __name__ == "__main__":
     train_and_save()

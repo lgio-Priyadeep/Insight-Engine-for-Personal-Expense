@@ -1,4 +1,4 @@
-import logging
+from logger_factory import get_logger
 import pandas as pd
 import warnings
 
@@ -7,8 +7,9 @@ warnings.filterwarnings("ignore")
 from schema import Col
 from pipeline import run_pipeline
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)
+from logger_factory import get_logger
+
+logger = get_logger(__name__)
 
 def run_real_data_tutorial(file_path: str, file_type: str = "csv"):
     """

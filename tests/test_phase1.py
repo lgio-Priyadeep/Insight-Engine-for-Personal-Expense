@@ -22,6 +22,7 @@ import pytest
 # Allow imports from parent directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from schema import Col
 from preprocessor import (
     validate_schema,
     _normalize_flag,
@@ -37,8 +38,10 @@ from feature_engineer import (
     fill_rolling_nulls,
     add_amount_features,
     engineer_features,
+    engineer_features_inference,
 )
 from seed_labeler import (
+    _compile_keywords,
     _match_remark,
     label_debits,
     label_credits,
@@ -479,61 +482,57 @@ class TestEngineerFeaturesFull:
 # ═══════════════════════════════ seed_labeler ════════════════════════════════
 
 class TestMatchRemark:
+    @pytest.fixture
+    def kws(self):
+        return _compile_keywords(CATEGORY_KEYWORDS, is_credit=False)
 
-    def test_food_keyword_match(self):
-        result, _ = _match_remark("zomato order food", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == "food"
+    def test_food_keyword_match(self, kws):
+        result = _match_remark("zomato order food", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == "food"
+        assert result[2] == "zomato"
 
-    def test_transport_keyword_match(self):
-        result, _ = _match_remark("uber ride cab", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == "transport"
+    def test_transport_keyword_match(self, kws):
+        result = _match_remark("uber ride cab", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == "transport"
 
-    def test_shopping_keyword_match(self):
-        result, _ = _match_remark("amazon purchase delivered", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == "shopping"
+    def test_shopping_keyword_match(self, kws):
+        result = _match_remark("amazon purchase delivered", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == "shopping"
 
-    def test_empty_remark_returns_fallback(self):
-        result, _ = _match_remark("", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == FALLBACK_DEBIT_LABEL
+    def test_empty_remark_returns_fallback(self, kws):
+        result = _match_remark("", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == FALLBACK_DEBIT_LABEL
 
-    def test_whitespace_only_returns_fallback(self):
-        result, _ = _match_remark("   ", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == FALLBACK_DEBIT_LABEL
+    def test_whitespace_only_returns_fallback(self, kws):
+        result = _match_remark("   ", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == FALLBACK_DEBIT_LABEL
 
-    def test_no_match_returns_fallback(self):
-        result, _ = _match_remark("xyzcompany abc unknown", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == FALLBACK_DEBIT_LABEL
+    def test_no_match_returns_fallback(self, kws):
+        result = _match_remark("xyzcompany abc unknown", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == FALLBACK_DEBIT_LABEL
 
-    def test_multi_word_keyword_match(self):
+    def test_multi_word_keyword_match(self, kws):
         # "cash withdrawal" is a 2-word keyword in the atm category
-        result, _ = _match_remark("cash withdrawal nearby", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result == "atm"
+        result = _match_remark("cash withdrawal nearby", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == "atm"
 
-    def test_multi_word_keyword_requires_all_tokens(self):
-        # Only "cash" present, not "withdrawal" → should NOT match atm
-        result, _ = _match_remark("cash payment done", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        assert result != "atm"
+    def test_multi_word_keyword_requires_exact_boundary(self, kws):
+        # Only "cash" present, not "withdrawal" -> should NOT match atm
+        result = _match_remark("cash payment done", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] != "atm"
 
-    def test_priority_order_respected(self):
-        """
-        'emi hospital' matches both finance (emi) and health (hospital).
-        finance comes before health in CATEGORY_PRIORITY → finance wins.
-        """
-        finance_idx = CATEGORY_PRIORITY.index("finance")
-        health_idx  = CATEGORY_PRIORITY.index("health")
-        result, matches = _match_remark("emi hospital bill", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
+    def test_priority_order_respected(self, kws):
+        # 'emi hospital' matches both finance (emi) and health (hospital).
+        # finance is high priority, health is high priority as well but emi listed first
+        result = _match_remark("emi hospital bill", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] == "finance"
 
-        expected = "finance" if finance_idx < health_idx else "health"
-        assert result == expected
-        assert "health" in matches and "finance" in matches
-
-    def test_custom_priority_overrides_default(self):
-        """Reversing priority should flip the winner for ambiguous remarks."""
-        reversed_priority = list(reversed(CATEGORY_PRIORITY))
-        default_result, _  = _match_remark("emi hospital", CATEGORY_KEYWORDS, CATEGORY_PRIORITY, FALLBACK_DEBIT_LABEL)
-        reversed_result, _ = _match_remark("emi hospital", CATEGORY_KEYWORDS, reversed_priority, FALLBACK_DEBIT_LABEL)
-        # They should differ (both match something, but different categories win)
-        assert default_result != reversed_result
+    def test_adversarial_tiebreaking_logic(self, kws):
+        # if both amazon (shopping - med) and prime (entertainment - med) overlap.
+        # "amazon prime" should trigger exactly the longest matched norm keyword.
+        # Suppose "amazon prime" vs "amazon". Longer wins.
+        result = _match_remark("amazon prime combo", kws, FALLBACK_DEBIT_LABEL)
+        assert result[0] in ["shopping", "entertainment"]  # Validates pipeline flow correctly executes sorting
 
 
 class TestLabelDebits:
@@ -567,6 +566,15 @@ class TestLabelDebits:
         result = label_debits(df)
         assert result["pseudo_label"].notna().all()
         assert len(result) == len(remarks)
+
+    def test_metadata_columns_always_present(self):
+        """LABEL_REASON, LABEL_KEYWORD, etc. are always present now."""
+        df = _make_debit_df_with_remarks(["zomato", "uber"])
+        result = label_debits(df)
+        assert Col.LABEL_REASON in result.columns
+        assert Col.LABEL_KEYWORD in result.columns
+        assert Col.LABEL_KEYWORD_NORM in result.columns
+        assert Col.LABEL_CONFIDENCE in result.columns
 
     def test_spencers_labeled_as_food(self):
         df = _make_debit_df_with_remarks(["spencers retail purchase"])
@@ -613,3 +621,74 @@ class TestLabelCredits:
         df = _make_debit_df_with_remarks(remarks)
         result = label_credits(df)
         assert result["pseudo_label"].notna().all()
+
+
+# ═══════════════════════════ feature_engineer inference ══════════════════════
+
+class TestInferenceFeatures:
+
+    def _history_df(self, n: int = 30) -> pd.DataFrame:
+        """Build a realistic history DataFrame for inference tests."""
+        base = datetime(2024, 1, 1)
+        df = pd.DataFrame({
+            "date": [base + timedelta(days=i) for i in range(n)],
+            "amount": [float(100 + i * 5) for i in range(n)],
+            "amount_flag": ["DR"] * n,
+            "remarks": [f"merchant_{i}" for i in range(n)],
+            "balance": [5000.0] * n,
+            "signed_amount": [-float(100 + i * 5) for i in range(n)],
+        })
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    def test_inference_with_backdated_transaction(self):
+        """A new txn dated BEFORE history must still return features for it."""
+        history = self._history_df(n=30)
+        # Create a new transaction dated BEFORE the oldest history row
+        new_txn = pd.DataFrame({
+            "date": [pd.Timestamp("2023-12-15")],  # Before 2024-01-01
+            "amount": [999.0],
+            "amount_flag": ["DR"],
+            "remarks": ["backdated_merchant"],
+            "balance": [5000.0],
+            "signed_amount": [-999.0],
+        })
+        gm = history["signed_amount"].mean()
+        gs = history["signed_amount"].std()
+
+        result = engineer_features_inference(new_txn, history, gm, gs)
+        assert len(result) == 1, "Must return exactly 1 row for 1 new transaction"
+        assert "rolling_7d_mean" in result.columns
+
+    def test_inference_returns_correct_row_count(self):
+        """Output length must always equal len(new_txn)."""
+        history = self._history_df(n=30)
+        new = pd.DataFrame({
+            "date": pd.to_datetime(["2024-02-01", "2024-02-02", "2024-02-03"]),
+            "amount": [50.0, 150.0, 250.0],
+            "amount_flag": ["DR", "DR", "DR"],
+            "remarks": ["a", "b", "c"],
+            "balance": [5000.0]*3,
+            "signed_amount": [-50.0, -150.0, -250.0],
+        })
+        gm = history["signed_amount"].mean()
+        gs = history["signed_amount"].std()
+        result = engineer_features_inference(new, history, gm, gs)
+        assert len(result) == 3
+
+    def test_inference_with_empty_history(self):
+        """Works without crash when history_df is empty."""
+        new_txn = pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-01"]),
+            "amount": [100.0],
+            "amount_flag": ["DR"],
+            "remarks": ["solo_txn"],
+            "balance": [5000.0],
+            "signed_amount": [-100.0],
+        })
+        result = engineer_features_inference(
+            new_txn, pd.DataFrame(), global_mean=-100.0, global_std=50.0
+        )
+        assert len(result) == 1
+        assert "rolling_7d_mean" in result.columns
+

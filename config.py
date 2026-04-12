@@ -224,18 +224,36 @@ MERCHANT_ALIASES: dict[str, str] = {
 
 
 # ── Debit Category Priority (highest → lowest) ────────────────────────────────
-# When a remark matches multiple categories, the one listed first wins.
-CATEGORY_PRIORITY = [
+# Hierarchical semantic lists. Higher lists override lower lists unconditionally.
+
+HIGH_PRIORITY = [
     "finance",      # EMI, loans, insurance — highest intent signal
     "health",       # pharmacy, hospital
     "utilities",    # electricity, internet, gas, dth
+]
+
+MEDIUM_PRIORITY = [
     "food",         # zomato, swiggy, restaurants
     "transport",    # uber, ola, fuel
     "shopping",     # amazon, flipkart, retail
     "entertainment",# streaming, gaming
+]
+
+LOW_PRIORITY = [
     "atm",          # cash withdrawal
     "transfer",     # self-transfers, NEFT, UPI
 ]
+
+CATEGORY_PRIORITY = HIGH_PRIORITY + MEDIUM_PRIORITY + LOW_PRIORITY
+
+TIER_MAPPING = {}
+for i, cat in enumerate(HIGH_PRIORITY):
+    TIER_MAPPING[cat] = {"tier_name": "high", "priority": 100 + i, "confidence": 1.0}
+for i, cat in enumerate(MEDIUM_PRIORITY):
+    TIER_MAPPING[cat] = {"tier_name": "medium", "priority": 200 + i, "confidence": 0.8}
+for i, cat in enumerate(LOW_PRIORITY):
+    TIER_MAPPING[cat] = {"tier_name": "low", "priority": 300 + i, "confidence": 0.6}
+
 
 # ── Debit Category Keywords ───────────────────────────────────────────────────
 # Keys must match entries in CATEGORY_PRIORITY exactly.
@@ -320,11 +338,38 @@ FALLBACK_CREDIT_LABEL = "other_credit"
 # Minimum labeling coverage before a warning is raised (0.0 – 1.0)
 MIN_COVERAGE_THRESHOLD = 0.40
 
-# Maximum amount variation ratio (max-min)/mean for recurring detection
-RECURRING_AMOUNT_TOLERANCE = 0.20
-
-# If amount drift ratio is higher than this (but within tolerance), downgrade confidence
-RECURRING_FLUCTUATION_PENALTY_THRESHOLD = 0.10
+# Single indisputable source of truth for recurring thresholds
+RECURRING_CONFIG = {
+    "monthly": {
+        "type": "monthly",
+        "min_gap": 27,
+        "max_gap": 33,
+        "var": 10
+    },
+    "weekly": {
+        "type": "weekly",
+        "min_gap": 6,
+        "max_gap": 8,
+        "var": 3
+    },
+    "biweekly": {
+        "type": "biweekly",
+        "min_gap": 13,
+        "max_gap": 16,
+        "var": 5
+    },
+    "quarterly": {
+        "type": "quarterly",
+        "min_gap": 85,
+        "max_gap": 95,
+        "var": 20
+    },
+    "global": {
+        "amount_tolerance": 0.20,
+        "min_occurrences": 3,
+        "fluctuation_penalty_threshold": 0.10
+    }
+}
 
 # ===========================================================================
 # INSIGHT ENGINE — ML-Based Insight & Tip Configuration
@@ -563,3 +608,30 @@ INSIGHT_TEMPLATES: dict[str, list[str]] = {
         "Budget watch: {category} spending is running above historical norms.",
     ],
 }
+
+
+def lookup_matching_tip_ids(category: str, insight_type: str) -> list[str]:
+    """
+    2-pass TIP_CORPUS lookup: category-specific first, then generic.
+
+    This is the canonical lookup used by both insight_generator._select_tip
+    and training_data_generator._find_best_tip. Centralised here to avoid
+    duplicate iteration logic.
+
+    Returns:
+        List of matching tip_ids (may be empty).
+    """
+    # Pass 1: category-specific match
+    specific = [
+        tid for tid, tip in TIP_CORPUS.items()
+        if category in tip["categories"] and insight_type in tip["insights"]
+    ]
+    if specific:
+        return specific
+
+    # Pass 2: generic match (empty categories list)
+    generic = [
+        tid for tid, tip in TIP_CORPUS.items()
+        if len(tip["categories"]) == 0 and insight_type in tip["insights"]
+    ]
+    return generic

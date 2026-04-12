@@ -18,12 +18,11 @@ Usage:
     require_columns(df, Col.REQUIRED_ANOMALY_DETECTOR, "anomaly_detector")
 """
 
-import logging
-from typing import FrozenSet
-
 import pandas as pd
+from typing import FrozenSet
+from logger_factory import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class Col:
@@ -60,6 +59,10 @@ class Col:
 
     # ── Seed Labeler Output ───────────────────────────────────────────────
     PSEUDO_LABEL = "pseudo_label"
+    LABEL_REASON = "label_reason"
+    LABEL_KEYWORD = "label_keyword"
+    LABEL_KEYWORD_NORM = "label_keyword_norm"
+    LABEL_CONFIDENCE = "label_confidence"
 
     # ── Categorization Model Output ───────────────────────────────────────
     PREDICTED_CATEGORY = "predicted_category"
@@ -76,6 +79,7 @@ class Col:
     IS_RECURRING = "is_recurring"
     RECURRING_FREQUENCY = "recurring_frequency"
     RECURRING_CONFIDENCE = "recurring_confidence"
+    RECURRING_SCORE = "recurring_score"
 
     # ── ML Insight Engine (benchmark / training) ──────────────────────────
     CATEGORY_CONFIDENCE = "category_confidence"
@@ -160,3 +164,30 @@ def require_columns(
             f"[{module_name}] Missing required columns: {sorted(missing)}. "
             f"Available: {sorted(df.columns)}"
         )
+
+def coerce_and_validate_types(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Safely coerce input columns to their expected types.
+    Strictly applies 'DROP + LOG' philosophy for unparseable garbage inputs.
+    """
+    df = df.copy()
+
+    # 1. Coerce Amount to float explicitly
+    if Col.AMOUNT in df.columns:
+        # errors='coerce' will turn garbage strings like "100.00xyz" into NaN
+        df[Col.AMOUNT] = pd.to_numeric(df[Col.AMOUNT], errors="coerce")
+        
+        # Validation + Drop
+        invalid_mask = df[Col.AMOUNT].isna()
+        if invalid_mask.any():
+            dropped_count = int(invalid_mask.sum())
+            logger.warning(
+                "Unparseable garbage detected in amount column. Dropping rows to preserve financial precision.",
+                extra={
+                    "event_type": "coercion_failure_drop",
+                    "metrics": {"dropped_count": dropped_count}
+                }
+            )
+            df = df.loc[~invalid_mask].reset_index(drop=True)
+
+    return df

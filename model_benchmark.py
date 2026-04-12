@@ -64,9 +64,11 @@ from catboost import CatBoostClassifier
 
 from training_data_generator import generate_insight_dataset
 
-# Suppress CatBoost verbose output and convergence warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+# Suppress known noisy warnings from ML libraries (scoped to specific patterns)
+warnings.filterwarnings("ignore", category=UserWarning, module="catboost")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*valid feature names.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning, module="lightgbm")
 
 logging.basicConfig(
     level=logging.INFO,

@@ -91,3 +91,77 @@ def test_expected_spend_model_extrapolates():
     
     # A tree model would cap strictly <= 42. Ridge will confidently scale ~1000 linearly.
     assert predicted_extrapolation > 500.0
+
+
+def test_percent_deviation_no_inf():
+    """percent_deviation must never contain inf or -inf."""
+    df = pd.DataFrame({
+        "is_weekend": [0, 1, 0], "month_sin": [0.5]*3, "month_cos": [0.5]*3,
+        "dow_sin": [0.1]*3, "dow_cos": [0.1]*3, "week_of_month": [1]*3,
+        "rolling_7d_mean": [100.0, 0.01, 200.0],
+        "rolling_30d_mean": [100.0, 0.01, 200.0],
+        "rolling_7d_std": [5.0, 0.01, 10.0],
+        "predicted_category": ["food"]*3,
+        "amount": [105.0, 0.5, 210.0]
+    })
+    pipeline = train_expected_spend_model(df)
+    result = predict_expected_spend(pipeline, df)
+    import numpy as np
+    assert not result["percent_deviation"].isin([np.inf, -np.inf]).any(), \
+        "percent_deviation contains inf values"
+
+
+def test_percent_deviation_negative_expected_amount():
+    """When expected_amount < 0 (RidgeCV extrapolation), percent_deviation must still be finite."""
+    df = pd.DataFrame({
+        "is_weekend": [0]*4, "month_sin": [0.5]*4, "month_cos": [0.5]*4,
+        "dow_sin": [0.1]*4, "dow_cos": [0.1]*4, "week_of_month": [1]*4,
+        "rolling_7d_mean": [10.0, 20.0, 30.0, 40.0],
+        "rolling_30d_mean": [10.0, 20.0, 30.0, 40.0],
+        "rolling_7d_std": [1.0]*4,
+        "predicted_category": ["food"]*4,
+        "amount": [11.0, 22.0, 31.0, 42.0]
+    })
+    pipeline = train_expected_spend_model(df)
+
+    # Force a scenario where expected_amount could go negative
+    df_test = df.copy()
+    df_test["rolling_7d_mean"] = [-100.0]*4
+    df_test["rolling_30d_mean"] = [-100.0]*4
+    result = predict_expected_spend(pipeline, df_test)
+    import numpy as np
+    assert not result["percent_deviation"].isin([np.inf, -np.inf]).any()
+    assert not result["percent_deviation"].isna().any()
+
+
+def test_percent_deviation_zero_expected_amount():
+    """When expected_amount ≈ 0, percent_deviation must be finite (floor clamp)."""
+    df = pd.DataFrame({
+        "is_weekend": [0]*4, "month_sin": [0.5]*4, "month_cos": [0.5]*4,
+        "dow_sin": [0.1]*4, "dow_cos": [0.1]*4, "week_of_month": [1]*4,
+        "rolling_7d_mean": [0.0]*4, "rolling_30d_mean": [0.0]*4,
+        "rolling_7d_std": [0.0]*4,
+        "predicted_category": ["food"]*4,
+        "amount": [0.0, 0.01, 0.5, 1.0]
+    })
+    pipeline = train_expected_spend_model(df)
+    result = predict_expected_spend(pipeline, df)
+    import numpy as np
+    assert not result["percent_deviation"].isin([np.inf, -np.inf]).any()
+
+
+def test_percent_deviation_normal_case():
+    """Standard case: deviation should be (actual - expected) / |expected|."""
+    df = pd.DataFrame({
+        "is_weekend": [0]*4, "month_sin": [0.5]*4, "month_cos": [0.5]*4,
+        "dow_sin": [0.1]*4, "dow_cos": [0.1]*4, "week_of_month": [1]*4,
+        "rolling_7d_mean": [100.0]*4, "rolling_30d_mean": [100.0]*4,
+        "rolling_7d_std": [5.0]*4,
+        "predicted_category": ["food"]*4,
+        "amount": [100.0, 200.0, 300.0, 400.0]
+    })
+    pipeline = train_expected_spend_model(df)
+    result = predict_expected_spend(pipeline, df)
+    # All percent_deviations must be finite floats
+    assert result["percent_deviation"].dtype == float
+    assert result["percent_deviation"].notna().all()

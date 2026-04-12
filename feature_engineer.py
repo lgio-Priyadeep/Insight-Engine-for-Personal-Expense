@@ -257,6 +257,10 @@ def engineer_features_inference(
     to the global mean, treating the live transaction accurately in the context
     of their last 30 transactions.
 
+    Uses tag-based row tracking (not tail()) to reliably extract only the
+    new transactions from the combined+sorted result, even when new_txn
+    contains backdated entries older than the history.
+
     Args:
         new_txn: DataFrame containing the new real-time transaction(s).
         history_df: DataFrame containing the user's past transactions (at least 30).
@@ -267,14 +271,21 @@ def engineer_features_inference(
     Returns:
         DataFrame enriched with features matching ONLY the length of `new_txn`.
     """
+    _TAG = "__is_new_txn__"
+
     if history_df is None or history_df.empty:
         logger.warning("No history provided for inference; rolling features will heavily default to global_mean.")
         combined = new_txn.copy()
+        combined[_TAG] = True
     else:
-        combined = pd.concat([history_df, new_txn], ignore_index=True)
+        hist = history_df.copy()
+        new = new_txn.copy()
+        hist[_TAG] = False
+        new[_TAG] = True
+        combined = pd.concat([hist, new], ignore_index=True)
 
-    # Note: engineer_features internally sorts by date. 
-    # If new_txn date is older than some history, it fits gracefully into the timeline.
+    # engineer_features internally sorts by date — that's fine.
+    # The _TAG column survives through all transformations.
     engineered = engineer_features(
         combined,
         global_mean=global_mean,
@@ -282,9 +293,11 @@ def engineer_features_inference(
         amount_col=amount_col
     )
 
-    # Sort again and slice exactly the number of new transactions.
-    # We rely on the index or simply tails if chronological.
-    # Wait, engineer_features sorts chronologically. We should fetch by original index,
-    # but since it's a live timeline, new_txns are at the end. Assuming new_txn are latest:
-    return engineered.tail(len(new_txn)).reset_index(drop=True)
+    # Extract only the new rows using the tag (not position-based tail)
+    result = engineered[engineered[_TAG]].drop(columns=[_TAG]).reset_index(drop=True)
+
+    # No cleanup needed: 'engineered' is local and goes out of scope.
+    # The tag column was already stripped from 'result' above.
+
+    return result
 

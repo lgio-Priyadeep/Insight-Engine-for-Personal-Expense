@@ -13,9 +13,10 @@ Usage:
         print(insight)
 """
 
-import logging
+from logger_factory import get_logger, generate_new_run_id
+from model_state import InsightModelState
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 from sklearn.pipeline import Pipeline as SklearnPipeline
@@ -31,22 +32,13 @@ from recurring_detector import find_recurring_transactions
 from insight_model import load_insight_ranker, predict_insight_scores
 from insight_generator import generate_human_insights
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class PipelineResult:
     """
     Immutable container for the full pipeline output.
-
-    Attributes:
-        debits:             Fully analysed debit DataFrame.
-        credits:            Labeled credit DataFrame.
-        insights:           List of human-readable insight strings.
-        cat_pipeline:       Trained categorization model (for inference reuse).
-        spend_pipeline:     Trained expected spend model (for inference reuse).
-        global_mean:        Training-set mean (for inference reuse).
-        global_std:         Training-set std (for inference reuse).
     """
     debits: pd.DataFrame
     credits: pd.DataFrame
@@ -57,55 +49,76 @@ class PipelineResult:
     global_mean: float = 0.0
     global_std: float = 0.0
 
+    def replace(self, **kwargs) -> "PipelineResult":
+        import dataclasses
+        return dataclasses.replace(self, **kwargs)
+
+
+def finalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure explicitly required float constraints map consistently post analysis"""
+    df = df.copy()
+    if Col.RECURRING_SCORE in df.columns:
+        df[Col.RECURRING_SCORE] = df[Col.RECURRING_SCORE].fillna(0.0)
+    return df
+
+def _optimize_memory_footprint(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast flag variables safely AFTER the ML pipeline finishes predicting."""
+    df = df.copy()
+    if Col.PREDICTED_CATEGORY in df.columns:
+        df[Col.PREDICTED_CATEGORY] = df[Col.PREDICTED_CATEGORY].astype('category')
+    if Col.IS_WEEKEND in df.columns:
+        df[Col.IS_WEEKEND] = df[Col.IS_WEEKEND].astype(bool)
+    return df
+
+
+def train_models(
+    debits: pd.DataFrame, 
+    label_col: str, 
+    target_col: str
+) -> InsightModelState:
+    cat_pipeline = train_categorization_model(debits, label_col=label_col)
+    debits = predict_categories(cat_pipeline, debits)
+    spend_pipeline = train_expected_spend_model(debits, target_col=target_col)
+    ranker_pipeline = load_insight_ranker()
+    return InsightModelState(
+        pipeline_version="1.0.0",
+        cat_pipeline=cat_pipeline,
+        spend_pipeline=spend_pipeline,
+        ranker_pipeline=ranker_pipeline,
+        global_mean=debits[Col.SIGNED_AMOUNT].mean(),
+        global_std=debits[Col.SIGNED_AMOUNT].std(),
+    )
+
 
 def run_pipeline(
     raw_df: pd.DataFrame,
     zscore_threshold: float = 3.0,
     pct_dev_threshold: float = 0.5,
-    amount_tolerance: float = 0.05,
     label_col: str = Col.PSEUDO_LABEL,
     target_col: str = Col.AMOUNT,
+    state: Optional[InsightModelState] = None,
 ) -> PipelineResult:
-    """
-    Execute the full Insight Engine pipeline end-to-end.
-
-    Phases:
-        1. Preprocessing  — schema validation, cleaning, debit/credit split
-        2. Labeling       — rule-based pseudo-labeling for model training
-        3. Features       — time, rolling, and amount feature engineering
-        4. ML Models      — categorization model + expected spend model
-        5. Signals        — anomaly detection + recurring transaction flagging
-        6. Insights       — natural language insight generation
-
-    Args:
-        raw_df:             Raw bank statement DataFrame.
-        zscore_threshold:   Z-score threshold for anomaly detection.
-        pct_dev_threshold:  Percent deviation threshold for anomaly detection.
-        amount_tolerance:   Amount variation tolerance for recurring detection.
-        label_col:          Name of the pseudo-label column.
-        target_col:         Name of the amount column for spend modelling.
-
-    Returns:
-        PipelineResult with fully analysed debits, credits, and insights.
-
-    Raises:
-        ValueError: on schema violations or missing columns.
-    """
+    generate_new_run_id()
+    
     logger.info("=" * 60)
-    logger.info("  INSIGHT ENGINE — Pipeline Start")
+    logger.info("  INSIGHT ENGINE — Pipeline Start", extra={"event_type": "pipeline_start"})
     logger.info("=" * 60)
+    logger.info(
+        "Pipeline mode initialized", 
+        extra={"event_type": "pipeline_mode", "metrics": {"mode": "training+inference" if state is None else "inference-only"}}
+    )
 
     # ── PHASE 1: Preprocessing ────────────────────────────────────────────
-    logger.info("[Phase 1] Preprocessing...")
+    logger.info("[Phase 1] Preprocessing...", extra={"event_type": "phase_start", "metrics": {"phase": 1}})
     debits, credits = preprocess(raw_df)
 
     # ── PHASE 2: Seed Labeling ────────────────────────────────────────────
-    logger.info("[Phase 2] Seed labeling...")
+    logger.info("[Phase 2] Seed labeling...", extra={"event_type": "phase_start", "metrics": {"phase": 2}})
     debits = label_debits(debits, label_col=label_col)
     credits = label_credits(credits, label_col=label_col)
 
     # ── PHASE 3: Feature Engineering ──────────────────────────────────────
-    logger.info("[Phase 3] Feature engineering...")
+    logger.info("[Phase 3] Feature engineering...", extra={"event_type": "phase_start", "metrics": {"phase": 3}})
     global_mean = debits[Col.SIGNED_AMOUNT].mean()
     global_std = debits[Col.SIGNED_AMOUNT].std()
 
@@ -117,40 +130,43 @@ def run_pipeline(
     )
 
     # ── PHASE 4: ML Models ────────────────────────────────────────────────
-    logger.info("[Phase 4] Training ML models...")
+    logger.info("[Phase 4] Machine Learning Models...", extra={"event_type": "phase_start", "metrics": {"phase": 4}})
+    if state is None:
+        logger.info(f"Training models explicitly on {len(debits)} rows.", extra={"event_type": "training_triggered", "metrics": {"row_count": len(debits)}})
+        new_state = train_models(debits, label_col, target_col)
+        cat_pipeline, spend_pipeline, ranker_pipeline = new_state.cat_pipeline, new_state.spend_pipeline, new_state.ranker_pipeline
+    else:
+        cat_pipeline, spend_pipeline, ranker_pipeline = state.cat_pipeline, state.spend_pipeline, state.ranker_pipeline
 
-    cat_pipeline = train_categorization_model(debits, label_col=label_col)
     debits = predict_categories(cat_pipeline, debits)
-
-    spend_pipeline = train_expected_spend_model(debits, target_col=target_col)
     debits = predict_expected_spend(spend_pipeline, debits)
 
     # ── PHASE 5: Signal Detection ─────────────────────────────────────────
-    logger.info("[Phase 5] Signal detection...")
-
+    logger.info("[Phase 5] Signal detection...", extra={"event_type": "phase_start", "metrics": {"phase": 5}})
     debits = detect_anomalies(
         debits,
         zscore_threshold=zscore_threshold,
         pct_dev_threshold=pct_dev_threshold,
     )
-
-    debits = find_recurring_transactions(
-        debits,
-        group_col=Col.CLEANED_REMARKS,
-        amount_tolerance=amount_tolerance,
-    )
+    debits = find_recurring_transactions(debits, group_col=Col.CLEANED_REMARKS)
 
     # ── PHASE 5.5: ML Insight Ranking ─────────────────────────────────────
-    logger.info("[Phase 5.5] Ranking candidate insights...")
-    ranker_pipeline = load_insight_ranker()
+    logger.info("[Phase 5.5] Ranking candidate insights...", extra={"event_type": "phase_start", "metrics": {"phase": "5.5"}})
     debits = predict_insight_scores(ranker_pipeline, debits)
 
     # ── PHASE 6: Insight Generation ───────────────────────────────────────
-    logger.info("[Phase 6] Generating insights...")
+    logger.info("[Phase 6] Generating insights...", extra={"event_type": "phase_start", "metrics": {"phase": 6}})
+    debits = finalize_df(debits)
+    credits = finalize_df(credits)
+    
+    # Safely downcast flag variables to optimize memory before giving results
+    debits = _optimize_memory_footprint(debits)
+    credits = _optimize_memory_footprint(credits)
+    
     insights = generate_human_insights(debits)
 
     logger.info("=" * 60)
-    logger.info(f"  Pipeline complete. Generated {len(insights)} insights.")
+    logger.info(f"  Pipeline complete. Generated {len(insights)} insights.", extra={"event_type": "pipeline_complete", "metrics": {"insights_count": len(insights)}})
     logger.info("=" * 60)
 
     return PipelineResult(
@@ -167,47 +183,76 @@ def run_pipeline(
 
 def run_inference(
     new_txn: pd.DataFrame,
-    result: PipelineResult,
+    state: InsightModelState,
+    history_df: pd.DataFrame,
+    zscore_threshold: float = 3.0,
+    pct_dev_threshold: float = 0.5,
 ) -> PipelineResult:
     """
-    Run inference on new transactions using pre-trained models from a
-    previous pipeline run.
+    Run inference on new transaction(s) using pre-trained models from a
+    prior ``run_pipeline`` result.
+
+    Unlike ``run_pipeline``, this function correctly stitches new
+    transactions against historical data via ``engineer_features_inference``
+    so that rolling features reflect the user's real spending history.
 
     Args:
-        new_txn:    New raw transaction(s) to analyse.
-        result:     PipelineResult from a previous run_pipeline() call.
-
-    Returns:
-        PipelineResult for the new transactions.
+        new_txn:            Raw DataFrame matching the schema's raw_input() contract.
+        state:              A previous InsightModelState.
+        history_df:         Historical baseline DataFrame (previously processed).
+        zscore_threshold:   Z-score gate for anomaly detection.
+        pct_dev_threshold:  Percent-deviation gate for anomaly detection.
     """
-    logger.info("Running inference on new transaction(s)...")
+    generate_new_run_id()
+    logger.info("Running inference on new transaction(s)...", extra={"event_type": "pipeline_inference_start"})
 
+    # ── Phase 1: Preprocess ──
     debits, credits = preprocess(new_txn)
+    debits = label_debits(debits, label_col=Col.PSEUDO_LABEL)
+    credits = label_credits(credits, label_col=Col.PSEUDO_LABEL)
 
-    debits = label_debits(debits)
-
+    # ── Phase 2: Feature Engineering (history-aware) ──
     debits = engineer_features_inference(
         debits,
-        history_df=result.debits,
-        global_mean=result.global_mean,
-        global_std=result.global_std,
+        history_df=history_df,
+        global_mean=state.global_mean,
+        global_std=state.global_std,
     )
 
-    debits = predict_categories(result.cat_pipeline, debits)
-    debits = predict_expected_spend(result.spend_pipeline, debits)
-    debits = detect_anomalies(debits)
-    debits = find_recurring_transactions(debits)
-    debits = predict_insight_scores(result.ranker_pipeline, debits)
+    # ── Phase 3: ML Prediction (pre-trained models) ──
+    cat_pipeline, spend_pipeline, ranker_pipeline = (
+        state.cat_pipeline, state.spend_pipeline, state.ranker_pipeline,
+    )
+    debits = predict_categories(cat_pipeline, debits)
+    debits = predict_expected_spend(spend_pipeline, debits)
 
+    # ── Phase 4: Signal Detection ──
+    debits = detect_anomalies(
+        debits,
+        zscore_threshold=zscore_threshold,
+        pct_dev_threshold=pct_dev_threshold,
+    )
+    debits = find_recurring_transactions(debits, group_col=Col.CLEANED_REMARKS)
+
+    # ── Phase 5: ML Insight Ranking ──
+    debits = predict_insight_scores(ranker_pipeline, debits)
+
+    # ── Phase 6: Finalize + Insight Generation ──
+    debits = finalize_df(debits)
+    credits = finalize_df(credits)
+    
+    debits = _optimize_memory_footprint(debits)
+    credits = _optimize_memory_footprint(credits)
+    
     insights = generate_human_insights(debits)
 
     return PipelineResult(
         debits=debits,
         credits=credits,
         insights=insights,
-        cat_pipeline=result.cat_pipeline,
-        spend_pipeline=result.spend_pipeline,
-        ranker_pipeline=result.ranker_pipeline,
-        global_mean=result.global_mean,
-        global_std=result.global_std,
+        cat_pipeline=cat_pipeline,
+        spend_pipeline=spend_pipeline,
+        ranker_pipeline=ranker_pipeline,
+        global_mean=state.global_mean,
+        global_std=state.global_std,
     )
