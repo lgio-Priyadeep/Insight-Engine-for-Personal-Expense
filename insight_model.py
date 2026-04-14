@@ -141,7 +141,12 @@ def load_insight_ranker(model_path: str = "models/insight_ranker.pkl") -> Option
         )
         return None
 
-    _verify_checksum(canonical_path, checksum_path)
+    try:
+        _verify_checksum(canonical_path, checksum_path)
+    except ModelSecurityError as e:
+        logger.error(str(e), extra={"event_type": "model_load_failure", "reason": "checksum mismatch"})
+        raise
+        
     logger.info(f"Model integrity verified (SHA-256 match) for {canonical_path}")
 
     try:
@@ -150,7 +155,7 @@ def load_insight_ranker(model_path: str = "models/insight_ranker.pkl") -> Option
         logger.info(f"Loaded Insight Ranker from {canonical_path}")
         return pipeline
     except Exception as e:
-        logger.error(f"Failed to load Insight Ranker: {e}")
+        logger.error(f"Failed to load Insight Ranker: {e}", extra={"event_type": "model_load_failure", "reason": "load crash"})
         return None
 
 
@@ -183,6 +188,15 @@ def predict_insight_scores(pipeline: Optional[Pipeline], df: pd.DataFrame) -> pd
         if X[col].isna().any():
             X[col] = X[col].fillna("unknown")
             
+    # Structurally enforce expected column order if pipeline exposes it
+    if hasattr(pipeline, "feature_names_in_"):
+        X = X[list(pipeline.feature_names_in_)]
+    else:
+        logger.warning(
+            "Insight ranker pipeline does not expose feature_names_in_. "
+            "Proceeding with default column ordering, which may be fragile."
+        )
+
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, message=".*valid feature names.*")

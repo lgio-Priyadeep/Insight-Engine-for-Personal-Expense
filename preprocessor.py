@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 import pandas as pd
 import numpy as np
 
-from config import NOISE_TOKENS, MERCHANT_ALIASES
+from config import NOISE_TOKENS, SPECIFIC_MERCHANT_ALIASES, GENERIC_ROUTER_ALIASES
 from schema import Col, require_columns, coerce_and_validate_types
 from logger_factory import get_logger
 
@@ -38,8 +38,11 @@ _SPECIAL_CHAR_PATTERN = re.compile(r"[^a-z0-9\s]")
 _MULTI_SPACE_PATTERN = re.compile(r"\s+")
 
 # Pre-compiled merchant alias patterns (avoids re-compilation per transaction)
-_COMPILED_ALIASES: list[tuple[re.Pattern, str]] = [
-    (re.compile(pattern), alias) for pattern, alias in MERCHANT_ALIASES.items()
+_COMPILED_SPECIFIC: list[tuple[re.Pattern, str]] = [
+    (re.compile(pattern), alias) for pattern, alias in SPECIFIC_MERCHANT_ALIASES.items()
+]
+_COMPILED_GENERIC: list[tuple[re.Pattern, str]] = [
+    (re.compile(pattern), alias) for pattern, alias in GENERIC_ROUTER_ALIASES.items()
 ]
 
 
@@ -159,36 +162,21 @@ def clean_remark(remark) -> str:
     
     # ── Merchant Alias Normalisation ──
     # Map the raw Indian routing string to our explicit Regex mappings
-    matched_aliases = []
-    generic_patterns_matched = []
     
-    # Generic routers that should be STRIPPED from string, rather than overriding the real merchant name!
-    generics = {
-        "upi transfer", "bank transfer", "paytm", "phonepe", "google pay",
-        "bhim", "amazon pay", "cred", "mobikwik", "payzapp", "freecharge",
-        "razorpay", "payu", "cashfree"
-    }
-
-    for compiled_re, alias in _COMPILED_ALIASES:
+    # 1. Check specific merchants first (deterministic order not required)
+    for compiled_re, alias in _COMPILED_SPECIFIC:
         if compiled_re.search(text):
-            alias_lower = alias.lower()
-            if alias_lower not in generics:
-                # Specific merchant found — return immediately.
-                # NOTE: relies on stable dict insertion order (Python 3.7+).
-                # If MERCHANT_ALIASES is ever loaded from JSON or regenerated
-                # dynamically, order must be preserved to maintain determinism.
-                return alias_lower
-            else:
-                matched_aliases.append(alias_lower)
-                generic_patterns_matched.append(compiled_re)
-    
-    if matched_aliases:
-        # ONLY generic routing tags found! (e.g., 'UPI Transfer')
-        # DO NOT return! Otherwise, unmapped uniquely Indian merchants are violently overwritten.
-        # Instead, dynamically strip out the generic routing text (e.g. "UPI/98293") from the string natively!
-        for gp in generic_patterns_matched:
-            text = gp.sub(" ", text)
-        # Text now safely falls entirely through to standard deduplication!
+            return alias.lower()
+            
+    # 2. Check generic router patterns
+    for compiled_re, alias in _COMPILED_GENERIC:
+        if compiled_re.search(text):
+            text = compiled_re.sub(" ", text)
+
+    # Note: If ONLY generic routing tags were found (e.g., 'UPI Transfer'),
+    # we DO NOT return them! Otherwise, unmapped uniquely Indian merchants are violently overwritten.
+    # We dynamically stripped out the generic routing text (e.g. "UPI/98293") from the string natively!
+    # Text now safely falls entirely through to standard deduplication!
 
     # ── Standard Deduplication Fallback ──
     text = _EMAIL_PATTERN.sub(" ", text)

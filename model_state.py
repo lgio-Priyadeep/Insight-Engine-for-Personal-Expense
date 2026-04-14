@@ -30,7 +30,7 @@ def save_model_state(filepath: str, state: InsightModelState) -> None:
     
     # Store explicitly rather than pickling the whole object indiscriminately
     payload = {
-        "pipeline_version": "1.0.0",
+        "pipeline_version": state.pipeline_version,
         "cat_pipeline": state.cat_pipeline,
         "spend_pipeline": state.spend_pipeline,
         "ranker_pipeline": state.ranker_pipeline,

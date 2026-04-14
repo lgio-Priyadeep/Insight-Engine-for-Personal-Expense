@@ -196,6 +196,12 @@ def run_inference(
     transactions against historical data via ``engineer_features_inference``
     so that rolling features reflect the user's real spending history.
 
+    PERFORMANCE WARNING:
+    This function recomputes historical rolling windows across `history_df`. 
+    Calling this sequentially in a tight loop for single-row DataFrames will 
+    bottleneck the system. Always pass a batch (e.g., a multi-row DataFrame) 
+    to `new_txn` for optimal rate efficiency instead of iterating.
+
     Args:
         new_txn:            Raw DataFrame matching the schema's raw_input() contract.
         state:              A previous InsightModelState.

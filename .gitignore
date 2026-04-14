@@ -1,5 +1,66 @@
-# Code Review Graph (MCP/local database and html output)
-.code-review-graph/
+# This is a template gitignore I use in every project. 
+# Sublte reminder to double-check
+
+
+
+# ========================
+# Python & Environments
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.venv/
+
+# ========================
+# Database & Secrets
+# ========================
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# ========================
+# Machine Learning Artifacts
+# ========================
+# Ignore huggingface local model weights and training checkpoints
+model_artifacts/
+sentiment_model_output/
+*.safetensors
+*.bin
+*.h5
+*.pt
+*.pth
+
+# ========================
+# Testing & Coverage
+# ========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ========================
+# Logs & Application Data
+# ========================
+logs/*.log
+!logs/.keep
+instance/
+data/
+*.log
+
+# ========================
+# IDE & System Files
+# ========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__MACOSX/
+.ipynb_checkpoints/
 
 # Python Virtual Environments & Caches
 venv/
@@ -8,20 +69,9 @@ __pycache__/
 .pytest_cache/
 catboost_info/
 
-# Local Model Weights (Should not be in Git to save space)
+# Local Model Weights 
 models/
 
-# Test data (Optional, but usually excluded to protect privacy limits unless explicitly shared)
+# Test data 
 test-data/
 
-
-.agents/
-.claude/
-.vscode/
-.mcp.json
-.opencode.json
-.windsurfrules
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-.cursorrules

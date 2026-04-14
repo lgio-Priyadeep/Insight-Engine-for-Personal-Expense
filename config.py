@@ -12,8 +12,7 @@ Multi-word keywords (e.g. "cash withdrawal") are fully supported.
 # ---------------------------------------------------------------------------
 # Merchant normalisation
 # ---------------------------------------------------------------------------
-MERCHANT_ALIASES: dict[str, str] = {
-
+GENERIC_ROUTER_ALIASES: dict[str, str] = {
     # ── UPI / Payments ───────────────────────────────────────────────────────
     r"upi[-/]?\d*":                         "UPI Transfer",
     r"paytm":                               "Paytm",
@@ -29,7 +28,9 @@ MERCHANT_ALIASES: dict[str, str] = {
     r"payu\b":                              "PayU",
     r"cashfree":                            "Cashfree",
     r"neft|rtgs|imps":                      "Bank Transfer",
+}
 
+SPECIFIC_MERCHANT_ALIASES: dict[str, str] = {
     # ── Food Delivery & QSR ──────────────────────────────────────────────────
     r"swiggy":                              "Swiggy",
     r"zomato":                              "Zomato",
