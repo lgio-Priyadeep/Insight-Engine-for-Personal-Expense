@@ -1,7 +1,9 @@
-# Insight Engine — File-by-File Breakdown
+# Insight Engine — File-by-File Technical Breakdown
 
-> **Scope**: Every non-excluded source file in the repository.
-> **Audience**: A developer who is smart but has never seen this codebase.
+> **Scope**: Every production source file in the repository.  
+**Audience**: A developer who is smart but has never seen this codebase.
+
+
 
 ---
 
@@ -9,589 +11,662 @@
 
 | # | File | Role |
 |---|------|------|
-| 1 | `config.py` | Central configuration & domain knowledge |
+| 1 | `config.py` | Declarative configuration hub |
 | 2 | `schema.py` | DataFrame column contract registry |
-| 3 | `logger_factory.py` | Structured JSON logging infrastructure |
-| 4 | `model_state.py` | ML model serialization container |
-| 5 | `preprocessor.py` | Data cleaning & normalization |
-| 6 | `feature_engineer.py` | Leak-free feature engineering |
-| 7 | `seed_labeler.py` | Keyword-based pseudo-label generation |
-| 8 | `categorization_model.py` | ML transaction categorization |
-| 9 | `expected_spend_model.py` | Expected spend regression |
-| 10 | `anomaly_detector.py` | Statistical anomaly flagging |
-| 11 | `recurring_detector.py` | Recurring transaction identification |
-| 12 | `insight_model.py` | ML insight ranking (LightGBM loader) |
-| 13 | `insight_generator.py` | Natural language insight output |
-| 14 | `pipeline.py` | Central orchestrator |
+| 3 | `logger_factory.py` | Structured JSON logging + run ID |
+| 4 | `preprocessor.py` | Data cleaning & normalization |
+| 5 | `feature_engineer.py` | Leak-free feature engineering |
+| 6 | `seed_labeler.py` | Keyword-based pseudo-label generation |
+| 7 | `categorization_model.py` | ML transaction categorization |
+| 8 | `expected_spend_model.py` | Expected spend regression |
+| 9 | `anomaly_detector.py` | Composite statistical anomaly flagging |
+| 10 | `recurring_detector.py` | Rule-based recurring transaction detection |
+| 11 | `insight_model.py` | ML insight ranking + model security |
+| 12 | `insight_generator.py` | Natural language insight translator |
+| 13 | `pipeline.py` | Central orchestrator |
+| 14 | `model_state.py` | Model persistence container |
 | 15 | `training_data_generator.py` | Synthetic labeled dataset generator |
-| 16 | `train_and_save_models.py` | Model training & serialization script |
-| 17 | `model_benchmark.py` | 12-model benchmark evaluation |
-| 18 | `demo.py` | Minimal pipeline demo |
-| 19 | `tutorial_real_data.py` | Real data ingestion tutorial |
-| 20 | `fix_detector.py` | One-shot patch script (legacy) |
-| 21 | `requirements.txt` | Production dependencies |
-| 22 | `requirements-dev.txt` | Development/test dependencies |
-| 23 | `.gitignore` | Repository exclusion rules |
-| 24–34 | `tests/*.py` | Test suites (7 test files + 4 runners) |
+| 16 | `model_benchmark.py` | Multi-model benchmark harness |
+| 17 | `train_and_save_models.py` | Model serialization script |
+| 18 | `demo.py` | Minimal usage example |
+| 19 | `tutorial_real_data.py` | Real bank statement ingestion tutorial |
+| 20 | `requirements.txt` | Runtime dependencies |
+| 21 | `requirements-dev.txt` | Dev/test dependencies |
 
 ---
 
-## 1. `config.py` (638 lines)
+## 1. `config.py` (639 lines)
 
-**Purpose**: The central brain of domain knowledge. Contains every configurable constant: merchant aliases, category keywords, priority tiers, recurring detection thresholds, insight types, tip corpus, and insight templates.
+### Purpose
+Single declarative source of truth for all business rules, keyword dictionaries, merchant aliases, priority mappings, insight templates, tip corpus, and pipeline constants. Zero executable logic beyond one lookup function.
 
-**Role in system**: Imported by almost every other module. Acts as the single source of truth for all business rules. No module should hardcode category names, keywords, or thresholds — they come from here.
+### Structure
 
-**Key Data Structures**:
+#### Merchant Normalisation Dictionaries
+- **`GENERIC_ROUTER_ALIASES`** (`dict[str, str]`, 14 entries): Maps regex patterns for generic payment routers (UPI, NEFT, RTGS, IMPS, Paytm, PhonePe, etc.) to canonical names. These are stripped from remarks during cleaning — they carry no merchant identity.
+- **`SPECIFIC_MERCHANT_ALIASES`** (`dict[str, str]`, ~170 entries): Maps regex patterns for known Indian merchants (Swiggy, Zomato, Amazon, IRCTC, Netflix, etc.) to canonical display names. When matched, the entire remark is replaced with the canonical name. Organized into 18 sub-domains: Food/QSR, Grocery, E-commerce, Electronics, Fashion, Transport, Hotels, Fuel, Streaming, Telecom, Utilities/DTH, Healthcare, Finance/Insurance, Education, Gaming, Real Estate.
 
-### `MERCHANT_ALIASES: dict[str, str]` (lines 15–223)
-- **What**: A dictionary mapping regex patterns to canonical merchant names.
-- **How it works**: Each key is a regex pattern (e.g. `r"swiggy"`). Each value is a clean merchant name (e.g. `"Swiggy"`). The preprocessor iterates these patterns against raw remarks. If a specific (non-generic) pattern matches, the remark is replaced entirely with the canonical name.
-- **Coverage**: ~150 Indian merchants across 18 categories (UPI/Payments, Food, Grocery, E-commerce, Electronics, Fashion, Transport, Hotels, Fuel, Streaming, Telecom, Utilities, Healthcare, Finance, Education, Gaming, Real Estate).
+#### Category Priority System
+- **`HIGH_PRIORITY`**: `["finance", "health", "utilities"]` — highest intent signal.
+- **`MEDIUM_PRIORITY`**: `["food", "transport", "shopping", "entertainment"]`.
+- **`LOW_PRIORITY`**: `["atm", "transfer"]` — least-actionable.
+- **`CATEGORY_PRIORITY`**: Concatenation of all three. Used as the ordered list for seed labeling tiebreaking.
+- **`TIER_MAPPING`** (`dict[str, dict]`): Auto-generated mapping from category → `{tier_name, priority (int), confidence (float)}`. High = priority 100+i, confidence 1.0. Medium = 200+i, 0.8. Low = 300+i, 0.6. This numeric priority drives deterministic label disambiguation in `seed_labeler.py`.
 
-### `CATEGORY_PRIORITY` / `TIER_MAPPING` (lines 229–255)
-- **What**: Defines the pecking order when a remark matches keywords from multiple categories.
-- **How it works**: Categories are split into 3 tiers — HIGH (finance, health, utilities), MEDIUM (food, transport, shopping, entertainment), LOW (atm, transfer). Each tier has an integer priority and a confidence score. When multiple keywords match, the one from the highest tier wins. Within a tier, the longest keyword match wins.
+#### Keyword Dictionaries
+- **`CATEGORY_KEYWORDS`** (`dict[str, list[str]]`, 9 categories): Debit-side keyword lists. Keys must exactly match `CATEGORY_PRIORITY` entries. All keywords are matched against normalized (lowercased, stripped) remarks.
+- **`CREDIT_KEYWORDS`** (`dict[str, list[str]]`, 4 categories): Credit-side keyword lists. Categories: `salary`, `refund`, `interest`, `transfer_in`.
+- **`CREDIT_PRIORITY`**: `["salary", "refund", "interest", "transfer_in"]`.
 
-### `CATEGORY_KEYWORDS: dict[str, list[str]]` (lines 261–307)
-- **What**: Maps each debit category to a list of keywords. Used by `seed_labeler.py` to pseudo-label transactions.
-- **Example**: `"food": ["swiggy", "zomato", "domino", ...]`
+#### Noise Tokens
+- **`NOISE_TOKENS`** (`set[str]`, 16 entries): Semantically empty tokens stripped during remark cleaning. Includes: `ref`, `no`, `by`, `being`, `towards`, `payment`, `txn`, `transaction`, `cr`, `dr`, `ac`, `a/c`, `the`, `and`, `or`, `to`, `from`.
 
-### `CREDIT_KEYWORDS` / `CREDIT_PRIORITY` (lines 312–324)
-- **What**: Same concept as debit keywords, but for credit transactions. Categories: salary, refund, interest, transfer_in. Fallback: `other_credit`.
+#### Pipeline Constants
+- **`FALLBACK_DEBIT_LABEL`**: `"uncategorized"` — assigned when no keyword matches.
+- **`FALLBACK_CREDIT_LABEL`**: `"other_credit"` — same for credits.
+- **`MIN_COVERAGE_THRESHOLD`**: `0.40` — labeling coverage below 40% triggers a warning.
 
-### `NOISE_TOKENS: set[str]` (lines 329–332)
-- **What**: Words stripped from remarks during cleaning. Examples: "ref", "no", "by", "payment", "txn", "cr", "dr".
+#### Recurring Transaction Config
+- **`RECURRING_CONFIG`** (`dict`): Defines 4 frequency buckets (`monthly`, `weekly`, `biweekly`, `quarterly`) each with `min_gap`, `max_gap`, and `var` thresholds in days. Also `global` config: `amount_tolerance=0.20`, `min_occurrences=3`, `fluctuation_penalty_threshold=0.10`.
 
-### Pipeline Constants (lines 335–372)
-- `FALLBACK_DEBIT_LABEL = "uncategorized"` — default label when no keyword matches a debit.
-- `FALLBACK_CREDIT_LABEL = "other_credit"` — default label when no keyword matches a credit.
-- `MIN_COVERAGE_THRESHOLD = 0.40` — if less than 40% of transactions are labeled, a warning fires.
-- `RECURRING_CONFIG` — thresholds for monthly (27–33 day gap), weekly (6–8), biweekly (13–16), quarterly (85–95), plus global settings (20% amount tolerance, min 3 occurrences).
+#### Insight Engine ML Config
+- **`INSIGHT_TYPES`** (`list[str]`, 5 entries): Classification targets for the Insight Ranker: `spending_spike`, `subscription`, `trend_warning`, `budget_risk`, `no_action`.
+- **`TIP_CORPUS`** (`dict[str, dict]`, ~35 entries): Human-vetted financial tips, each tagged with applicable `categories` (list) and `insights` (list). Empty `categories` = universal applicability. Organized by domain: food, shopping, transport, utilities, entertainment, finance, health, ATM, transfer, generic.
+- **`INSIGHT_TEMPLATES`** (`dict[str, list[str]]`): Multiple phrasing variants per insight type for variety. Each template contains Python format-string placeholders (`{category}`, `{merchant}`, `{amount}`, `{pct}`, `{date}`, `{frequency}`).
 
-### `INSIGHT_TYPES` (lines 379–385)
-- 5 classification targets: `spending_spike`, `subscription`, `trend_warning`, `budget_risk`, `no_action`.
+#### Function: `lookup_matching_tip_ids(category, insight_type) → list[str]`
+Two-pass TIP_CORPUS lookup: category-specific first, then generic (empty categories list). Returns list of matching tip IDs. Used by both `insight_generator._select_tip` and `training_data_generator._find_best_tip` to centralize iteration logic.
 
-### `TIP_CORPUS: dict[str, dict]` (lines 390–584)
-- **What**: ~30 human-vetted financial tips, each tagged with applicable categories and insight types.
-- **How it works**: When the insight generator detects a spending spike in "food", it looks up tips tagged with `categories=["food"]` and `insights=["spending_spike"]`. If nothing category-specific matches, it falls back to generic tips (`categories=[]`).
+### Dependencies
+None (pure Python data declarations + one function).
 
-### `INSIGHT_TEMPLATES` (lines 588–610)
-- Multiple phrasing templates per insight type. The generator randomly selects one (seeded for determinism) to avoid repetitive output.
-
-### `lookup_matching_tip_ids()` function (lines 613–637)
-- **What**: 2-pass lookup — first category-specific tips, then generic. Used by both `insight_generator.py` and `training_data_generator.py`.
-
-**Dependencies**: None (pure data module).
-**Who uses it**: `preprocessor.py`, `seed_labeler.py`, `recurring_detector.py`, `insight_generator.py`, `training_data_generator.py`.
+### Consumed By
+`preprocessor.py`, `seed_labeler.py`, `recurring_detector.py`, `insight_generator.py`, `training_data_generator.py`.
 
 ---
 
 ## 2. `schema.py` (194 lines)
 
-**Purpose**: The DataFrame column contract registry. Every column name used anywhere in the pipeline is defined here as a constant.
+### Purpose
+Central contract registry for every DataFrame column name used across the pipeline. Prevents silent breakage from column renames by forcing all modules to reference constants from `Col`.
 
-**Role in system**: Prevents silent breakage from column renames. If a column name changes, you change it once here and every module picks it up.
+### Class: `Col`
+A namespace class (not instantiated) holding string constants for every column name:
 
-### Class `Col` (lines 28–142)
-- **Responsibility**: Holds all column name constants as class attributes plus static methods that return required column sets per module.
-- **Column Groups**:
-  - **Raw Input**: `date`, `amount`, `amount_flag`, `remarks`, `balance`
-  - **Preprocessor Output**: `signed_amount`, `cleaned_remarks`
-  - **Feature Engineer**: `dow_sin`, `dow_cos`, `month_sin`, `month_cos`, `is_weekend`, `week_of_month`, `rolling_7d_mean`, `rolling_7d_std`, `rolling_30d_mean`, `amount_log`, `amount_zscore`
-  - **Seed Labeler**: `pseudo_label`, `label_reason`, `label_keyword`, `label_keyword_norm`, `label_confidence`
-  - **Categorization Model**: `predicted_category`
-  - **Expected Spend**: `expected_amount`, `residual`, `percent_deviation`
-  - **Anomaly Detector**: `is_anomaly`
-  - **Recurring Detector**: `is_recurring`, `recurring_frequency`, `recurring_confidence`, `recurring_score`
-  - **ML Insight Engine**: `category_confidence`, `insight_type`, `tip_id`, `insight_score`
-- **Static methods**: `raw_input()`, `feature_engineer_input()`, `seed_labeler_input()`, etc. — each returns a `FrozenSet[str]` of required columns for that module.
+| Group | Constants |
+|-------|-----------|
+| Raw Input | `DATE`, `AMOUNT`, `AMOUNT_FLAG`, `REMARKS`, `BALANCE` |
+| Preprocessor Output | `SIGNED_AMOUNT`, `CLEANED_REMARKS` |
+| Feature Engineer Output | `DOW_SIN`, `DOW_COS`, `MONTH_SIN`, `MONTH_COS`, `IS_WEEKEND`, `WEEK_OF_MONTH`, `ROLLING_7D_MEAN`, `ROLLING_7D_STD`, `ROLLING_30D_MEAN`, `AMOUNT_LOG`, `AMOUNT_ZSCORE` |
+| Seed Labeler Output | `PSEUDO_LABEL`, `LABEL_REASON`, `LABEL_KEYWORD`, `LABEL_KEYWORD_NORM`, `LABEL_CONFIDENCE` |
+| Categorization Model Output | `PREDICTED_CATEGORY` |
+| Expected Spend Output | `EXPECTED_AMOUNT`, `RESIDUAL`, `PERCENT_DEVIATION` |
+| Anomaly Detector Output | `IS_ANOMALY` |
+| Recurring Detector Output | `IS_RECURRING`, `RECURRING_FREQUENCY`, `RECURRING_CONFIDENCE`, `RECURRING_SCORE` |
+| ML Insight Engine | `CATEGORY_CONFIDENCE`, `INSIGHT_TYPE`, `TIP_ID`, `INSIGHT_SCORE` |
 
-### `require_columns()` function (lines 145–166)
-- **Input**: DataFrame, set of required column names, module name string.
-- **Output**: Raises `ValueError` listing missing columns, or does nothing if all present.
-- **Logic**: `missing = required - set(df.columns)`. If `missing` is non-empty, raise.
+#### Static Methods (Input Contracts)
+Each returns a `FrozenSet[str]` defining the required columns for a specific module:
 
-### `coerce_and_validate_types()` function (lines 168–193)
-- **Input**: DataFrame.
-- **Output**: DataFrame with `amount` column coerced to float. Rows with unparseable garbage are dropped and logged.
-- **Logic**: Uses `pd.to_numeric(errors="coerce")` to turn invalid amount strings into NaN, then drops NaN rows.
+| Method | Required Columns |
+|--------|-----------------|
+| `raw_input()` | `date`, `amount`, `amount_flag`, `remarks` |
+| `feature_engineer_input()` | `date`, `amount`, `signed_amount` |
+| `seed_labeler_input()` | `cleaned_remarks` |
+| `categorization_model_input()` | `cleaned_remarks`, `amount_log` |
+| `expected_spend_input()` | `amount`, `predicted_category`, `rolling_7d_mean` |
+| `anomaly_detector_input()` | `amount_zscore`, `percent_deviation`, `amount` |
+| `recurring_detector_input()` | `cleaned_remarks`, `date`, `amount` |
+| `insight_generator_input()` | `is_anomaly`, `is_recurring` |
+| `insight_ranker_input()` | 14 columns (amount, zscore, deviation, confidence, anomaly, recurring, weekend, rolling stats, month encoding, amount_log, predicted_category) |
 
-**Dependencies**: `pandas`, `logger_factory`.
-**Who uses it**: Every pipeline module.
+### Function: `require_columns(df, required, module_name) → None`
+Validates a DataFrame contains all required columns. Raises `ValueError` with sorted list of missing columns and available columns.
+
+### Function: `coerce_and_validate_types(df) → DataFrame`
+Coerces the `amount` column to numeric (`pd.to_numeric` with `errors="coerce"`). Rows with unparseable garbage are dropped and logged. Uses DROP+LOG philosophy: corrupted data is removed, never silently converted.
+
+### Dependencies
+- `pandas` — DataFrame operations.
+- `logger_factory` — structured logging.
+
+### Design Rationale
+By centralizing column names as constants, a column rename requires exactly one string change. Every consumer picks up the change via import. The `FrozenSet` return type prevents accidental mutation.
 
 ---
 
 ## 3. `logger_factory.py` (56 lines)
 
-**Purpose**: Provides structured JSON logging with pipeline run ID tracing.
+### Purpose
+Provides structured JSON logging with automatic pipeline run ID injection via `contextvars`.
 
-**Role in system**: Every module calls `get_logger(__name__)` at import time. All log output is JSON-formatted with timestamp, level, logger name, message, pipeline_run_id, and optional event_type/metrics fields.
+### Components
 
-### `pipeline_run_id_ctx` (line 8)
-- A `contextvars.ContextVar` holding the current run ID. Defaults to `"UNKNOWN_RUN"`. Set by `generate_new_run_id()` at pipeline start.
+#### `pipeline_run_id_ctx` (`ContextVar[str]`)
+Thread-safe context variable holding the current pipeline run ID. Default: `"UNKNOWN_RUN"`. Set by `generate_new_run_id()` at pipeline invocation start.
 
-### `generate_new_run_id()` (lines 10–13)
-- Generates `run_<8 hex chars>` and stores it in the context variable.
+#### `generate_new_run_id() → str`
+Creates a UUID-based run ID (`run_{hex8}`) and stores it in the context variable. Called at the top of `run_pipeline()` and `run_inference()`.
 
-### Class `JSONFormatter` (lines 16–39)
-- **Responsibility**: Formats log records as JSON objects.
-- **Output fields**: `timestamp` (UTC ISO), `level`, `logger`, `message`, `pipeline_run_id`, optional `event_type`, optional `metrics`, optional `exception`.
+#### Class: `JSONFormatter(logging.Formatter)`
+Custom formatter that emits structured JSON log lines with fields:
+- `timestamp` — UTC ISO-8601.
+- `level` — log level.
+- `logger` — logger name (module path).
+- `message` — formatted message.
+- `pipeline_run_id` — injected from `contextvars`.
+- `event_type` — optional, from `record.event_type`.
+- `metrics` — optional dict, from `record.metrics`.
+- `exception` — traceback string if present.
 
-### `get_logger()` (lines 41–55)
-- Returns a logger with `JSONFormatter` attached. Uses `propagate=False` to prevent double-logging through root logger. Idempotent — won't attach duplicate handlers.
+#### `get_logger(name) → Logger`
+Factory function returning a logger configured with `JSONFormatter`. Guards against duplicate handler attachment. Sets `propagate=False` to prevent root logger pollution.
 
-**Dependencies**: `json`, `logging`, `contextvars`, `uuid`, `datetime`.
-**Who uses it**: Every module.
+### Dependencies
+- `json`, `logging`, `contextvars`, `uuid`, `datetime` (all stdlib).
 
----
-
-## 4. `model_state.py` (60 lines)
-
-**Purpose**: Immutable container for serialized ML pipeline components. Ensures no raw DataFrames (containing PII) are accidentally persisted to disk.
-
-### `InsightModelState` dataclass (lines 7–18)
-- **Fields**: `pipeline_version` (str), `cat_pipeline` (sklearn Pipeline or None), `spend_pipeline`, `ranker_pipeline`, `global_mean` (float), `global_std` (float).
-- **Used by**: `pipeline.py` to pass pre-trained models between `run_pipeline()` and `run_inference()`.
-
-### `save_model_state()` (lines 20–41)
-- **Input**: filepath, InsightModelState.
-- **Logic**: Validates that `global_mean` and `global_std` are floats (not DataFrames). Constructs a dict payload and saves via `joblib.dump()`.
-
-### `load_model_state()` (lines 43–59)
-- **Input**: filepath.
-- **Logic**: Loads via `joblib.load()`, verifies `pipeline_version == "1.0.0"`, reconstructs `InsightModelState`.
-
-**Dependencies**: `joblib`, `numpy`, `dataclasses`, `sklearn`.
-**Who uses it**: `pipeline.py`.
+### Consumed By
+Every module in the codebase.
 
 ---
 
-## 5. `preprocessor.py` (314 lines)
+## 4. `preprocessor.py` (302 lines)
 
-**Purpose**: Cleans raw bank statement data. The first stage of the pipeline.
+### Purpose
+Entry point for data normalization. Performs schema validation, date parsing, flag normalization, signed amount computation, remark cleaning with merchant aliasing, zero-row removal, deduplication, and debit/credit splitting.
 
-**Role in system**: Takes messy CSV data and produces two clean DataFrames (debits, credits) with normalized flags, signed amounts, and cleaned remarks.
+### Module-Level Compiled Patterns
+- `_LONG_DIGIT_PATTERN` — matches 4+ digit runs (UPI refs, phone numbers).
+- `_EMAIL_PATTERN` — matches email-like patterns.
+- `_SPECIAL_CHAR_PATTERN` — matches non-alphanumeric, non-space characters.
+- `_MULTI_SPACE_PATTERN` — matches consecutive whitespace.
+- `_COMPILED_SPECIFIC` — pre-compiled `(regex, alias)` tuples from `SPECIFIC_MERCHANT_ALIASES`.
+- `_COMPILED_GENERIC` — pre-compiled `(regex, alias)` tuples from `GENERIC_ROUTER_ALIASES`.
 
-### Pre-compiled Regex Patterns (lines 32–43)
-- `_LONG_DIGIT_PATTERN`: Matches 4+ digit runs (account numbers, phone numbers, UPI refs) for removal.
-- `_EMAIL_PATTERN`: Matches email addresses for removal.
-- `_SPECIAL_CHAR_PATTERN`: Matches non-alphanumeric non-space characters.
-- `_MULTI_SPACE_PATTERN`: Collapses multiple spaces.
-- `_COMPILED_ALIASES`: Pre-compiled `MERCHANT_ALIASES` regex patterns (compiled once at import time).
+These are compiled at module load time (once), not per-transaction.
 
-### `validate_schema()` (lines 48–54)
-- Calls `require_columns(df, Col.raw_input(), "preprocessor")`. Raises if missing columns.
+### Functions
 
-### `_parse_and_sort_dates()` (lines 59–81)
-- Parses `date` column as ISO 8601 (`YYYY-MM-DD`), sorts chronologically. Raises `ValueError` on parse failure.
+#### `validate_schema(df) → None`
+Delegates to `require_columns(df, Col.raw_input(), "preprocessor")`. Logs success.
 
-### `_normalize_flag()` (lines 86–100)
-- Normalizes a single `amount_flag` value to `"DR"` or `"CR"`. Case-insensitive, strips whitespace. Returns `None` for unrecognized/non-string input.
+#### `_parse_and_sort_dates(df) → DataFrame`
+Parses the `date` column using strict ISO-8601 (`YYYY-MM-DD`). Raises `ValueError` on failure. Sorts chronologically. Logs min/max date range.
 
-### `_compute_signed_amount()` (lines 103–129)
-- Applies `_normalize_flag` to every row. Invalid flags default to `"DR"` (not dropped). Derives `signed_amount`: DR → −|amount|, CR → +|amount|.
+#### `_normalize_flag(flag) → Optional[str]`
+Normalizes a single `amount_flag` to `"DR"` or `"CR"`. Strips whitespace, uppercases. Returns `None` for non-string or unrecognized values.
 
-### `normalize()` (lines 134–142)
-- Strips ALL special characters (including @ and &) from text. Used for safe regex `\b` boundary matching. Returns lowercase, space-separated alphanumeric tokens.
+#### `_compute_signed_amount(df) → DataFrame`
+Applies `_normalize_flag` to every row. Invalid flags default to `"DR"` (defensive). Computes `signed_amount`: DR → `-abs(amount)`, CR → `+abs(amount)`.
 
-### `clean_remark()` (lines 144–204)
-- **The most complex function in the preprocessor.** Step-by-step:
-  1. Guard: non-string/empty → return `""`.
-  2. Lowercase the text.
-  3. **Merchant Alias Matching**: Iterate pre-compiled aliases. If a specific (non-generic) merchant matches, return its canonical lowercase name immediately (e.g., `"swiggy"`). Generic routers (UPI Transfer, Paytm, PhonePe, etc.) are NOT returned as the merchant name — instead, their matched patterns are stripped from the text, and processing continues.
-  4. **Standard Cleanup Fallback**: Remove emails, long digit runs, special characters, collapse whitespace.
-  5. Filter out noise tokens and single-character tokens.
-  6. Return the cleaned string.
-- **OBSERVATION**: The early return for specific merchants (line 180) relies on Python 3.7+ dict insertion order. If `MERCHANT_ALIASES` is ever loaded dynamically, order must be preserved.
+#### `normalize(text) → str`
+Strips all special characters including `@` and `&`, lowercases, collapses whitespace. Returns pure alphanumeric + space. Used for safe regex `\b` boundary matching.
 
-### `_drop_zero_amount()` (lines 209–222)
-- Removes rows where `amount == 0`.
+#### `clean_remark(remark) → str`
+Core remark cleaning pipeline:
+1. Guard: non-string/empty → `""`.
+2. Lowercase.
+3. **Specific merchant match**: iterates `_COMPILED_SPECIFIC`. On first match, returns the canonical alias (lowercased) immediately. This is a full replacement — the original remark is discarded.
+4. **Generic router substitution**: iterates `_COMPILED_GENERIC`. On match, the router pattern is stripped from the text (not replaced with alias). This preserves the merchant identity embedded after routing information.
+5. **Standard fallback**: strips emails, long digit runs, special characters, noise tokens, single-character tokens.
 
-### `_deduplicate()` (lines 225–243)
-- Drops exact duplicates on `(date, amount, remarks, amount_flag)`, keeping first occurrence.
+**Critical design choice**: Specific merchants short-circuit (return early). Generic routers only strip — they never overwrite unique merchant identity embedded in UPI narrations.
 
-### `_split_debit_credit()` (lines 248–264)
-- Splits DataFrame into debits (flag=="DR") and credits (flag=="CR"). Both are independently reset-indexed.
+#### `_drop_zero_amount(df) → DataFrame`
+Removes rows where `amount == 0`. Logs count.
 
-### `preprocess()` — Public API (lines 269–313)
-- **Full pipeline**: validate_schema → coerce_and_validate_types → parse_and_sort_dates → compute_signed_amount → drop_zero_amount → deduplicate → clean_remark → split_debit_credit.
-- **Returns**: `(debit_df, credit_df)`.
+#### `_deduplicate(df) → DataFrame`
+Drops duplicates on `(date, amount, remarks, amount_flag)`, keeping first.
 
-**Dependencies**: `re`, `pandas`, `numpy`, `config`, `schema`, `logger_factory`.
-**Who uses it**: `pipeline.py`, `seed_labeler.py` (imports `normalize`).
+#### `_split_debit_credit(df) → Tuple[DataFrame, DataFrame]`
+Splits by `amount_flag == "DR"` vs `"CR"`. Both independently reset-indexed.
 
----
+#### `preprocess(df) → Tuple[DataFrame, DataFrame]`
+Public API orchestrating the full pipeline: validate → coerce types → parse dates → compute signed amount → drop zeros → deduplicate → clean remarks → split.
 
-## 6. `feature_engineer.py` (304 lines)
+### Dependencies
+- `config.py` — `NOISE_TOKENS`, `SPECIFIC_MERCHANT_ALIASES`, `GENERIC_ROUTER_ALIASES`.
+- `schema.py` — `Col`, `require_columns`, `coerce_and_validate_types`.
+- `logger_factory.py` — `get_logger`.
 
-**Purpose**: Produces time, rolling, and amount features from preprocessed data. Explicitly prevents data leakage.
-
-**Role in system**: Phase 3 of the pipeline. Enriches the DataFrame with 11 new columns that ML models consume.
-
-### `add_time_features()` (lines 46–69)
-- Computes: `is_weekend` (0/1), `week_of_month` (1–5), `month_sin`/`month_cos` (cyclical 12-period), `dow_sin`/`dow_cos` (cyclical 7-period).
-
-### `add_rolling_features()` (lines 74–110)
-- **Leakage Prevention**: Shifts the amount column by 1 position BEFORE computing rolling windows. Row i's window contains only rows 0…i−1.
-- Computes: `rolling_7d_mean` (window=7, min_periods=1), `rolling_30d_mean` (window=30, min_periods=1), `rolling_7d_std` (window=7, min_periods=2).
-- NaNs are left for the caller to fill.
-- **GOOD DESIGN**: The `shift(1)` before `rolling()` is the core leakage prevention mechanism.
-
-### `fill_rolling_nulls()` (lines 113–144)
-- Fills NaN values in rolling columns with training-set global statistics. `global_mean` fills mean columns, `global_std` fills std column. If `global_std == 0`, uses 1.0 as fallback.
-
-### `add_amount_features()` (lines 149–184)
-- `amount_log`: `log1p(|amount|)` — handles negatives, compresses scale.
-- `amount_zscore`: `(amount − rolling_mean) / rolling_std`, clipped to [−5, +5]. Zero-std rows use std=1.0.
-
-### `engineer_features()` — Public API (lines 189–243)
-- Full pipeline: add_time → add_rolling → fill_nulls → add_amount. Enforces chronological sort.
-
-### `engineer_features_inference()` (lines 246–303)
-- **For live inference**: Concatenates new transaction(s) with historical data, engineers features on the combined set, then extracts only the new rows using a tag column (`__is_new_txn__`).
-- **GOOD DESIGN**: Uses tag-based row tracking instead of `tail()` to handle backdated transactions correctly.
-
-**Dependencies**: `numpy`, `pandas`, `schema`.
-**Who uses it**: `pipeline.py`.
+### Output Contract
+Two DataFrames (debits, credits) each containing: original columns + `signed_amount` + `cleaned_remarks`.
 
 ---
 
-## 7. `seed_labeler.py` (215 lines)
+## 5. `feature_engineer.py` (304 lines)
 
-**Purpose**: Converts cleaned remarks into pseudo-labels using keyword matching. These pseudo-labels become the training target for the categorization ML model.
+### Purpose
+Produces time, rolling, and amount features with strict leakage prevention. Rolling statistics use `shift(1)` to ensure row i's window only contains rows 0…i-1.
 
-### `CompiledKeyword` dataclass (lines 36–44)
-- Holds: `text` (original keyword), `norm` (normalized), `pattern` (compiled regex), `category`, `tier_name`, `priority` (int), `confidence` (float).
+### Constants
+- `ZSCORE_CLIP = 5.0` — clipping bound for z-score.
 
-### `_compile_keywords()` (lines 49–72)
-- Pre-compiles all keywords from a keyword map into `CompiledKeyword` objects with `\b` word-boundary regex patterns. Builds priority/confidence from `TIER_MAPPING`.
+### Functions
 
-### `_match_remark()` (lines 75–106)
-- **Matching logic**:
-  1. Run all compiled keyword patterns against the normalized remark.
-  2. Collect all matches.
-  3. Find the HIGHEST priority tier among matches.
-  4. Among same-tier matches, sort by longest keyword first (then alphabetically for determinism).
-  5. Return the best match's category, reason, keyword text, keyword norm, and confidence.
-- Returns fallback label if no match.
+#### `add_time_features(df) → DataFrame`
+Adds from the `date` column:
+- `is_weekend` — binary (Saturday/Sunday).
+- `week_of_month` — 1-5 based on day of month.
+- `month_sin`, `month_cos` — cyclical 12-period encoding.
+- `dow_sin`, `dow_cos` — cyclical 7-period encoding.
 
-### Module-level precompilation (lines 110–111)
-- `_DEFAULT_DEBIT_KWS` and `_DEFAULT_CREDIT_KWS` are compiled at import time from the default keyword maps.
+Raises `TypeError` if `date` is not datetime64.
 
-### `_log_coverage()` (lines 116–140)
-- Logs what percentage of rows received a non-fallback label. Warns if below `MIN_COVERAGE_THRESHOLD` (40%).
+#### `add_rolling_features(df, amount_col) → DataFrame`
+**Leakage-safe**: Shifts the amount column by 1 position FIRST, then applies `.rolling()`.
+- `rolling_7d_mean` — mean(shifted, window=7, min_periods=1).
+- `rolling_30d_mean` — mean(shifted, window=30, min_periods=1).
+- `rolling_7d_std` — std(shifted, window=7, min_periods=2).
 
-### `label_debits()` / `label_credits()` — Public API (lines 145–214)
-- Apply `_match_remark` to every row in the DataFrame. Produce columns: `pseudo_label`, `label_reason`, `label_keyword`, `label_keyword_norm`, `label_confidence`.
-- Re-normalizes remarks as a boundary hardening measure.
+Short DataFrames (≤1 row) get NaN columns.
 
-**Dependencies**: `re`, `pandas`, `config`, `preprocessor` (imports `normalize`), `schema`.
-**Who uses it**: `pipeline.py`.
+#### `fill_rolling_nulls(df, global_mean, global_std) → DataFrame`
+Fills NaN from rolling window warmup with training-set statistics. **CRITICAL**: `global_mean`/`global_std` must be from the training partition only. Deriving from `df` would leak test set information.
 
----
+#### `add_amount_features(df, amount_col) → DataFrame`
+- `amount_log` — `log1p(|amount|)` (safe for negatives).
+- `amount_zscore` — `(amount - rolling_7d_mean) / rolling_7d_std`, clipped to `[-5, 5]`. Zero-std rows use std=1.0.
 
-## 8. `categorization_model.py` (127 lines)
+#### `engineer_features(df, global_mean, global_std, amount_col) → DataFrame`
+Public API for training: sorts chronologically, then chains time → rolling → fill → amount features. Warns if global stats are auto-derived (acceptable for inference, not training).
 
-**Purpose**: ML-based transaction categorization using TF-IDF + Logistic Regression.
+#### `engineer_features_inference(new_txn, history_df, global_mean, global_std, amount_col) → DataFrame`
+Stateless live-inference entrypoint. Concatenates `new_txn` with `history_df`, uses a `__is_new_txn__` boolean tag column to track which rows are new. Runs full `engineer_features` on the combined set, then extracts only tagged rows. This ensures rolling windows reflect real spending history, not just the new transaction in isolation.
 
-### `build_categorization_pipeline()` (lines 32–54)
-- Builds a sklearn Pipeline:
-  - **Text**: TF-IDF on `cleaned_remarks` (unigrams + bigrams, max 2000 features).
-  - **Numeric**: StandardScaler on `amount_log` (with_mean=False to keep sparse matrix).
-  - **Classifier**: LogisticRegression with `class_weight="balanced"`, max_iter=1000.
-- `sparse_threshold=1.0` forces ColumnTransformer output to stay sparse (prevents OOM).
-
-### `train_categorization_model()` (lines 57–94)
-- Drops rows with missing values or fallback labels. Fits the pipeline. Logs training accuracy.
-
-### `predict_categories()` (lines 97–127)
-- Predicts `predicted_category` and `category_confidence` (max class probability).
-
-**Dependencies**: `sklearn`, `pandas`, `config`, `schema`.
-**Who uses it**: `pipeline.py`.
+### Dependencies
+- `schema.py` — `Col`, `require_columns`.
+- `numpy`, `pandas`.
 
 ---
 
-## 9. `expected_spend_model.py` (135 lines)
+## 6. `seed_labeler.py` (215 lines)
 
-**Purpose**: Regression model that estimates the "normal" expected spending for a transaction.
+### Purpose
+Converts cleaned remarks into pseudo-labels using keyword dictionaries from `config.py`. These pseudo-labels become training targets for the ML categorization model.
 
-### `build_spend_pipeline()` (lines 31–56)
-- sklearn Pipeline:
-  - **Numeric**: StandardScaler on 9 features (time + rolling stats).
-  - **Categorical**: OneHotEncoder on `predicted_category`.
-  - **Regressor**: RidgeCV (alphas: 0.1, 1.0, 10.0, 100.0).
-- **GOOD DESIGN**: RidgeCV is chosen over tree-based models because it can **extrapolate** beyond training range — trees cap at the max training value.
+### Dataclass: `CompiledKeyword`
+Fields: `text`, `norm`, `pattern` (compiled regex), `category`, `tier_name`, `priority` (int), `confidence` (float).
 
-### `train_expected_spend_model()` (lines 59–92)
-- Drops rows with missing essential columns. Fits the pipeline. Logs R² score.
+### Functions
 
-### `predict_expected_spend()` (lines 95–134)
-- Predicts `expected_amount`. Derives `residual = actual − expected` and `percent_deviation = residual / |expected|`.
-- **Safety**: Clips `|expected|` to a minimum of 1.0 to prevent division by zero or sign inversion from negative extrapolation.
+#### `_compile_keywords(keyword_map, is_credit) → list[CompiledKeyword]`
+Compiles keyword strings into regex patterns using `\b` word boundaries on already-normalized text. For debit keywords, lookups `TIER_MAPPING` for priority/confidence metadata. Credit keywords get default `priority=999, confidence=0.5`.
 
-**Dependencies**: `sklearn`, `pandas`, `numpy`, `schema`.
-**Who uses it**: `pipeline.py`.
+#### `_match_remark(norm_remark, compiled_keywords, fallback) → tuple`
+Matches a normalized remark against all compiled keywords. On multiple matches: selects the lowest-priority tier (highest priority), then within that tier selects the longest keyword (most specific), breaking ties lexicographically.
 
----
+Returns: `(label, reason, keyword_triggered, keyword_norm, confidence)`.
 
-## 10. `anomaly_detector.py` (49 lines)
+#### `_log_coverage(df, label_col, fallback_labels, context, min_coverage_threshold) → float`
+Computes labeling coverage (fraction of rows NOT assigned fallback labels). Warns if below `MIN_COVERAGE_THRESHOLD` (40%).
 
-**Purpose**: Flags unusual transactions using a dual-gate composite heuristic.
+#### `label_debits(df, remark_col, label_col, keyword_map) → DataFrame`
+Public API for debit labeling. Re-normalizes the remark column as a boundary hardening measure (safe even if called without preprocessor). Applies `_match_remark` to every row, producing 5 metadata columns: `pseudo_label`, `label_reason`, `label_keyword`, `label_keyword_norm`, `label_confidence`.
 
-### `detect_anomalies()` (lines 16–48)
-- **Logic**: A transaction is anomalous if BOTH conditions hold:
-  1. `|amount_zscore| > zscore_threshold` (default 3.0) — statistically unusual.
-  2. `|percent_deviation| > pct_dev_threshold` (default 0.5) — ML expected spend model also surprised.
-- **Design rationale**: The dual-gate prevents low-value transactions from triggering alarms just because they technically miss mathematical expectations.
-- **Output**: Boolean column `is_anomaly`.
+#### `label_credits(df, ...) → DataFrame`
+Same structure as `label_debits`, using `CREDIT_KEYWORDS` and `FALLBACK_CREDIT_LABEL`.
 
-**Dependencies**: `pandas`, `schema`.
-**Who uses it**: `pipeline.py`.
+### Module-Level Pre-Compilation
+- `_DEFAULT_DEBIT_KWS` — compiled from `CATEGORY_KEYWORDS`.
+- `_DEFAULT_CREDIT_KWS` — compiled from `CREDIT_KEYWORDS`.
 
----
+Compiled once at module load. If custom `keyword_map` is passed to `label_debits`/`label_credits`, keywords are recompiled.
 
-## 11. `recurring_detector.py` (118 lines)
-
-**Purpose**: Identifies subscription-like recurring transactions using a deterministic scoring equation.
-
-### `find_recurring_transactions()` (lines 21–117)
-- **Step-by-step**:
-  1. Group transactions by `cleaned_remarks`.
-  2. Skip groups with fewer than `min_occurrences` (default 3).
-  3. Compute time gaps between consecutive occurrences.
-  4. **Amount Score (A)**: `1.0 − (amount_drift / amount_tolerance)`, clamped [0,1]. Measures how consistent the amounts are.
-  5. **Temporal Score (T)**: Check if mean gap fits a known frequency (monthly, weekly, biweekly, quarterly). If yes, `T = 1.0 − (variance / allowed_variance)`, clamped [0,1].
-  6. **Volume Score (V)**: `len(group) / 12`, clamped [0,1]. 12 occurrences = perfect year.
-  7. **Final Score**: `0.4*A + 0.4*T + 0.2*V`.
-  8. If either A or T is 0.0, the group is rejected.
-  9. If `assigned_freq` is set and scores pass, mark all rows in that group as recurring.
-- **Output columns**: `is_recurring` (bool), `recurring_frequency` (str or None), `recurring_confidence` (float), `recurring_score` (float).
-
-**Dependencies**: `pandas`, `numpy`, `config`, `schema`.
-**Who uses it**: `pipeline.py`.
+### Dependencies
+- `config.py` — all keyword/priority/fallback constants.
+- `preprocessor.py` — `normalize` function.
+- `schema.py` — `Col`, `require_columns`.
 
 ---
 
-## 12. `insight_model.py` (208 lines)
+## 7. `categorization_model.py` (127 lines)
 
-**Purpose**: Loads a pre-trained LightGBM model from disk and uses it to score transactions by "insightfulness".
+### Purpose
+Trains and applies an ML classifier to generalize pseudo-labels to unseen transaction remarks.
 
-### Security Architecture (lines 40–111)
-- **`ModelSecurityError`**: Custom exception for integrity failures.
-- **`_compute_checksum()`**: SHA-256 hex digest of a file.
-- **`_verify_checksum()`**: Compares a model file against its companion `.sha256` file. Raises `ModelSecurityError` on mismatch.
-- **`_validate_model_path()`**: Canonicalizes path and verifies it's within the `models/` directory. Prevents path traversal and symlink attacks.
-- **GOOD DESIGN**: Model files are never deserialized without passing all three checks (existence, path validation, checksum verification).
+### Function: `build_categorization_pipeline() → Pipeline`
+Constructs a sklearn Pipeline:
+- **Preprocessor** (`ColumnTransformer`):
+  - `text` — `TfidfVectorizer(ngram_range=(1,2), max_features=2000)` on `cleaned_remarks`.
+  - `num` — `StandardScaler(with_mean=False)` on `amount_log`. `with_mean=False` prevents sparse→dense explosion.
+- **Classifier**: `LogisticRegression(class_weight="balanced", max_iter=1000)`.
+- `sparse_threshold=1.0` forces sparse output to prevent OOM on large datasets.
 
-### `load_insight_ranker()` (lines 114–154)
-- Returns `None` if file not found (graceful degradation). Returns `None` if checksum file missing (unsigned model rejected). Raises `ModelSecurityError` if checksum fails. Loads via `pickle.load()` if all checks pass.
+### Function: `train_categorization_model(df, label_col) → Pipeline`
+Validates input contract. Drops rows with missing critical columns. **Excludes fallback labels** (`uncategorized`, `other_credit`) from training to prevent the model from learning the fallback as a class — the model should predict real categories from text patterns. Logs training accuracy.
 
-### `predict_insight_scores()` (lines 157–207)
-- If pipeline is `None`: defaults all scores to 0.0 (falls back to rule-based prioritization).
-- If pipeline exists: predicts class probabilities. Score = `1.0 − P(no_action)`. The higher the score, the more "insightful" the transaction.
-- Catches all exceptions gracefully, defaulting to 0.0 on failure.
+### Function: `predict_categories(pipeline, df) → DataFrame`
+Predicts `predicted_category` and `category_confidence` (max probability across all classes). Fills missing strings with `""` and missing amounts with `0.0` before prediction.
 
-**Dependencies**: `hashlib`, `os`, `pickle`, `sklearn`, `pandas`, `schema`.
-**Who uses it**: `pipeline.py`, `train_and_save_models.py`.
-
----
-
-## 13. `insight_generator.py` (182 lines)
-
-**Purpose**: Translates ML flags into human-readable financial insight strings.
-
-### `_select_tip()` (lines 26–54)
-- Uses `lookup_matching_tip_ids()` from config. Randomly selects from matching tips using a seeded RNG.
-
-### `generate_human_insights()` (lines 57–181)
-- **Step-by-step**:
-  1. Sorts DataFrame chronologically.
-  2. **Subscriptions**: Groups recurring transactions by merchant. For each group, selects a template from `INSIGHT_TEMPLATES["subscription"]`, formats it, and selects a matching tip.
-  3. **Anomalies**: For each anomalous row, selects a template from `INSIGHT_TEMPLATES["spending_spike"]`, formats with category/merchant/amount/deviation/date.
-  4. **Diversity Ranking**: 2-pass algorithm:
-     - Pass 1: Take the highest-scoring insight of each TYPE (subscription, spike) to guarantee variety.
-     - Pass 2: Fill remaining slots up to `top_n` with highest-scoring candidates regardless of type.
-  5. Sorts final selection by ML score descending.
-  6. Outputs insight + tip pairs as strings.
-- **Determinism**: All random selections use a seeded `random.Random(seed)` instance.
-
-**Dependencies**: `random`, `pandas`, `config`, `schema`.
-**Who uses it**: `pipeline.py`.
+### Dependencies
+- `config.py` — `FALLBACK_DEBIT_LABEL`, `FALLBACK_CREDIT_LABEL`.
+- `schema.py` — `Col`, `require_columns`.
+- `sklearn` — TF-IDF, StandardScaler, LogisticRegression, ColumnTransformer, Pipeline.
 
 ---
 
-## 14. `pipeline.py` (259 lines)
+## 8. `expected_spend_model.py` (135 lines)
 
-**Purpose**: The central orchestrator. Wires all modules into a single `run_pipeline()` call.
+### Purpose
+Trains a regression model estimating the normal expected spending amount for a transaction. The residual (actual - expected) feeds the anomaly detector.
 
-### `PipelineResult` dataclass (lines 38–54)
-- **Frozen (immutable)**. Contains: `debits` (DataFrame), `credits` (DataFrame), `insights` (List[str]), `cat_pipeline`, `spend_pipeline`, `ranker_pipeline`, `global_mean`, `global_std`.
-- Has a `replace()` helper using `dataclasses.replace()`.
+### Function: `build_spend_pipeline() → Pipeline`
+- **Numeric features** (9): `is_weekend`, `month_sin/cos`, `dow_sin/cos`, `week_of_month`, `rolling_7d_mean`, `rolling_30d_mean`, `rolling_7d_std`.
+- **Categorical features** (1): `predicted_category` (OneHotEncoded, `handle_unknown="ignore"`).
+- **Regressor**: `RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0])` — linear with automatic regularization tuning. Linear model prevents wild extrapolation.
 
-### `finalize_df()` (lines 57–62)
-- Fills NaN in `recurring_score` with 0.0.
+### Function: `train_expected_spend_model(df, target_col) → Pipeline`
+Drops rows with missing essential columns. Logs R² score.
 
-### `_optimize_memory_footprint()` (lines 64–71)
-- Downcasts `predicted_category` to pandas categorical type, `is_weekend` to bool. Called AFTER all ML predictions are complete.
+### Function: `predict_expected_spend(pipeline, df) → DataFrame`
+Adds 3 columns:
+- `expected_amount` — model prediction.
+- `residual` — `actual - expected`.
+- `percent_deviation` — `residual / |expected|`.
 
-### `train_models()` (lines 74–90)
-- Helper: trains categorization model, predicts categories, trains expected spend model, loads ranker. Returns `InsightModelState`.
+**Division safety**: `|expected|` clipped to `lower=1.0` to prevent division by zero and sign inversion from negative RidgeCV extrapolation. Clipping events are logged.
 
-### `run_pipeline()` (lines 93–181) — **Primary Entry Point**
-- **Phase 1**: `preprocess(raw_df)` → debits, credits.
-- **Phase 2**: `label_debits(debits)`, `label_credits(credits)`.
-- **Phase 3**: Compute `global_mean`/`global_std` on debits, then `engineer_features()`.
-- **Phase 4**: If no pre-trained state, train all models. Then `predict_categories()` and `predict_expected_spend()`.
-- **Phase 5**: `detect_anomalies()` and `find_recurring_transactions()`.
-- **Phase 5.5**: `predict_insight_scores()` via the LightGBM ranker.
-- **Phase 6**: `finalize_df()`, `_optimize_memory_footprint()`, `generate_human_insights()`.
-- Returns `PipelineResult`.
+### Dependencies
+- `schema.py` — `Col`, `require_columns`.
+- `sklearn` — StandardScaler, OneHotEncoder, RidgeCV, ColumnTransformer, Pipeline.
 
-### `run_inference()` (lines 184–258) — **Live Inference Entry Point**
-- Designed for processing new transaction(s) against pre-trained models.
-- Uses `engineer_features_inference()` to stitch new transactions against historical data for accurate rolling features.
-- Same phases as `run_pipeline` but skips training — uses provided `InsightModelState`.
+---
 
-**Dependencies**: Every pipeline module, `logger_factory`, `model_state`, `dataclasses`, `sklearn`.
-**Who uses it**: `demo.py`, `tutorial_real_data.py`, tests.
+## 9. `anomaly_detector.py` (49 lines)
+
+### Purpose
+Flags unusual transactions using a dual-gate composite heuristic.
+
+### Function: `detect_anomalies(df, zscore_threshold=3.0, pct_dev_threshold=0.5) → DataFrame`
+A transaction is flagged `is_anomaly=True` only if BOTH conditions hold:
+1. `|amount_zscore| > zscore_threshold` — historically unusual (statistical).
+2. `|percent_deviation| > pct_dev_threshold` — ML expected spend failure (contextual).
+
+This composite prevents low-value but statistically unusual expenses from triggering alarms. Both `.abs()` gates catch spikes in either direction.
+
+### Dependencies
+- `schema.py` — `Col`, `require_columns`.
+
+---
+
+## 10. `recurring_detector.py` (118 lines)
+
+### Purpose
+Groups transactions by merchant and identifies stable temporal frequencies indicating subscriptions, standing orders, or recurring bills.
+
+### Function: `find_recurring_transactions(df, group_col) → DataFrame`
+Groups by `cleaned_remarks`. For each group with ≥ `min_occurrences` (3):
+
+1. **Amount Score (A)**: `1.0 - (amount_drift / amount_tolerance)`. Measures how stable the charge amount is. `amount_drift = (max - min) / mean`. Clamped to [0, 1].
+
+2. **Temporal Score (T)**: Assigns a frequency bucket (weekly/biweekly/monthly/quarterly) if `mean_gap` falls within `[min_gap, max_gap]`. Score: `1.0 - (variance / expected_var)`. Clamped to [0, 1].
+
+3. **Volume Score (V)**: `len(group) / 12.0` — normalized to 1.0 for a "perfect year" of occurrences. Clamped to [0, 1].
+
+**Rejection gate**: If T=0 or A=0, the group is rejected (no frequency match or wildly varying amounts).
+
+**Final score**: `0.4*A + 0.4*T + 0.2*V`.
+
+Output columns: `is_recurring` (bool), `recurring_frequency` (str), `recurring_confidence` (float), `recurring_score` (float).
+
+### Dependencies
+- `config.py` — `RECURRING_CONFIG`.
+- `schema.py` — `Col`, `require_columns`.
+
+---
+
+## 11. `insight_model.py` (222 lines)
+
+### Purpose
+Loads and applies the pre-trained LightGBM Insight Ranker, implementing security-hardened model loading.
+
+### Constants
+- `NUMERIC_FEATURES` — 13 features matching `Col.insight_ranker_input()`.
+- `CATEGORICAL_FEATURES` — `[predicted_category]`.
+- `_MODELS_DIR` — `models/` relative to `__file__`.
+
+### Exception: `ModelSecurityError`
+Raised on integrity verification failure.
+
+### Security Functions
+
+#### `_compute_checksum(file_path) → str`
+SHA-256 hex digest, computed in 8KB chunks.
+
+#### `_verify_checksum(model_path, checksum_path) → bool`
+Reads expected checksum from `.sha256` companion file. Compares against actual. Raises `ModelSecurityError` on mismatch.
+
+#### `_validate_model_path(model_path) → str`
+Canonicalizes path via `os.path.realpath()`. Verifies it starts with the `_MODELS_DIR` prefix. Prevents path traversal and symlink attacks.
+
+### Function: `load_insight_ranker(model_path) → Optional[Pipeline]`
+Loading sequence:
+1. Check file existence → return `None` if missing (graceful degradation).
+2. Validate path (canonicalization + directory check).
+3. Verify checksum (SHA-256). Refuse unsigned models (missing `.sha256` file).
+4. `pickle.load()` on verified file.
+
+Returns `None` on any non-security failure. **Raises** `ModelSecurityError` on checksum mismatch (potential tampering).
+
+### Function: `predict_insight_scores(pipeline, df) → DataFrame`
+If pipeline is `None`, defaults all scores to 0.0 (rule-based fallback). Otherwise:
+1. Validates input contract.
+2. Fills NaN defensively (0.0 for numeric, `"unknown"` for categorical).
+3. Aligns column order to `pipeline.feature_names_in_` if exposed.
+4. Calls `pipeline.predict_proba(X)`.
+5. Computes `insight_score = 1.0 - P(no_action)`. The `no_action` class means zero insight value; 1−P(no_action) measures how "insightful" a transaction is.
+6. Catches all exceptions, falling back to 0.0.
+
+### Dependencies
+- `schema.py` — `Col`, `require_columns`.
+- `hashlib`, `os`, `pickle` — file I/O and security.
+- `sklearn.pipeline.Pipeline` — type annotations.
+
+---
+
+## 12. `insight_generator.py` (182 lines)
+
+### Purpose
+Translates the enriched DataFrame into human-readable financial insight strings, ranked by the ML insight score.
+
+### Function: `_select_tip(category, insight_type, rng) → str`
+Uses `lookup_matching_tip_ids()` from config.py for a 2-pass lookup (specific → generic). Randomly selects from matches using a seeded `random.Random` instance. Returns empty string if no match.
+
+### Function: `generate_human_insights(df, top_n=10, seed=42) → List[str]`
+1. **Subscriptions**: Groups recurring transactions by merchant. For each group, formats a subscription insight using `INSIGHT_TEMPLATES["subscription"]` with merchant, amount, frequency.
+2. **Anomalies**: Iterates anomaly-flagged rows. Formats spending spike insights using `INSIGHT_TEMPLATES["spending_spike"]` with category, merchant, amount, percent deviation, date.
+3. **Diversity Ranking**: Two-pass algorithm guarantees at least one insight per type (subscription, spike) appears if available. Pass 1: grab highest-scoring insight of EACH type. Pass 2: fill remaining quota with absolute highest scores.
+4. Each insight is optionally paired with a tip from TIP_CORPUS.
+5. Final output sorted strictly by ML insight score.
+
+### Reproducibility
+All random selections (template choice, tip selection) use a seeded `random.Random(seed)` instance. Identical inputs + identical seed → identical outputs.
+
+### Dependencies
+- `config.py` — `TIP_CORPUS`, `INSIGHT_TEMPLATES`, `lookup_matching_tip_ids`.
+- `schema.py` — `Col`, `require_columns`.
+
+---
+
+## 13. `pipeline.py` (265 lines)
+
+### Purpose
+Central orchestrator wiring all modules into a single `run_pipeline()` call. No module beyond this file needs to know execution order.
+
+### Dataclass: `PipelineResult` (frozen)
+Immutable container: `debits`, `credits` (DataFrames), `insights` (list[str]), `cat_pipeline`, `spend_pipeline`, `ranker_pipeline` (Optional sklearn Pipelines), `global_mean`, `global_std` (floats). Provides `.replace(**kwargs)` for functional updates.
+
+### Function: `finalize_df(df) → DataFrame`
+Fills `recurring_score` NaN with 0.0 to guarantee float consistency.
+
+### Function: `_optimize_memory_footprint(df) → DataFrame`
+Post-ML downcasting: `predicted_category` → pandas `category` dtype, `is_weekend` → `bool`.
+
+### Function: `train_models(debits, label_col, target_col) → InsightModelState`
+Trains all 3 ML models (categorization, expected spend, insight ranker) and packages them into `InsightModelState`.
+
+### Function: `run_pipeline(raw_df, zscore_threshold, pct_dev_threshold, label_col, target_col, state) → PipelineResult`
+Full pipeline in 6 phases:
+1. **Preprocess** — `preprocess(raw_df)`.
+2. **Seed Label** — `label_debits(debits)`, `label_credits(credits)`.
+3. **Feature Engineer** — computes global stats, `engineer_features(debits)`.
+4. **ML Models** — if `state is None`, trains all models; otherwise uses pre-trained. Then predicts categories + expected spend.
+5. **Signal Detection** — `detect_anomalies()`, `find_recurring_transactions()`.
+6. **Insight Generation** — `predict_insight_scores()`, finalizes, optimizes memory, `generate_human_insights()`.
+
+If `state` is provided, skips training (inference-only mode).
+
+### Function: `run_inference(new_txn, state, history_df, ...) → PipelineResult`
+Inference path for new transactions with pre-trained models:
+1. Preprocess + seed label.
+2. Feature engineer using `engineer_features_inference` (history-aware).
+3. Predict categories + expected spend.
+4. Detect anomalies + recurring.
+5. Score + generate insights.
+
+Performance warning documented: recomputes historical rolling windows. Batch new_txn for efficiency.
+
+### Dependencies
+All other engine modules + `model_state.py`.
+
+---
+
+## 14. `model_state.py` (60 lines)
+
+### Purpose
+Immutable serialization container for ML pipeline components. Prevents accidental PII persistence.
+
+### Dataclass: `InsightModelState`
+Fields: `pipeline_version` (str), `cat_pipeline`, `spend_pipeline`, `ranker_pipeline` (Optional sklearn Pipelines), `global_mean`, `global_std` (floats).
+
+### Function: `save_model_state(filepath, state) → None`
+Type-asserts `global_mean` and `global_std` are floats (blocks accidental DataFrame serialization). Uses `joblib.dump`.
+
+### Function: `load_model_state(filepath) → InsightModelState`
+Loads via `joblib.load`. Validates `pipeline_version == "1.0.0"`. Raises `ValueError` on mismatch.
+
+### Dependencies
+- `joblib` — serialization.
+- `numpy` — type checking.
+- `sklearn.pipeline.Pipeline` — type annotations.
 
 ---
 
 ## 15. `training_data_generator.py` (430 lines)
 
-**Purpose**: Generates synthetic labeled datasets for training the Insight Ranker. No real user data is used.
+### Purpose
+Generates synthetic labeled datasets for training the Insight Ranker and Tip Selector models. No real user data is used.
 
-### `_generate_base_features()` (lines 52–125)
-- Creates `n` synthetic feature vectors calibrated against typical Indian transaction patterns. Uses lognormal distribution for amounts (~₹500 center), beta distribution for category confidence (skewed high), etc.
+### Constants
+- `ALL_CATEGORIES` — `CATEGORY_PRIORITY + ["uncategorized"]`.
+- `ACTIONABLE_INSIGHTS` — all `INSIGHT_TYPES` except `no_action`.
 
-### `_apply_labels()` (lines 128–235)
-- Assigns `insight_type` labels with target distribution: ~60% no_action, ~10% each for spending_spike, subscription, trend_warning, budget_risk.
-- **Crucially**: Adjusts feature values to be CONSISTENT with labels. Spending spikes get high z-scores. Subscriptions get `is_recurring=1`. No-action rows get benign features.
-- Assigns `tip_id` using `_find_best_tip()`.
+### Functions
 
-### `_add_edge_cases()` (lines 238–365)
-- Adds 5 types of adversarial samples: borderline z-scores, high z-score + tiny amount, recurring-looking but variable, weekend spikes, low-confidence categorization.
+#### `_find_best_tip(category, insight_type) → str`
+Deterministic tip selection using `lookup_matching_tip_ids`. Returns first match or `"no_tip"`.
 
-### `generate_insight_dataset()` — Public API (lines 370–429)
-- Returns `(X_train, X_test, y_train, y_test)` with stratified split on `insight_type`.
+#### `_generate_base_features(n, rng) → DataFrame`
+Generates 14-column synthetic feature vectors calibrated to Indian bank statement distributions:
+- Amounts: lognormal centered around ~₹500 (range ₹10–₹100,000).
+- Rolling stats: derived from amount with noise.
+- Category confidence: Beta(5,2) skewed toward high confidence.
+- Categories: weighted distribution matching typical Indian spending.
 
-**Dependencies**: `numpy`, `pandas`, `sklearn`, `config`.
-**Who uses it**: `train_and_save_models.py`, `model_benchmark.py`, tests.
+#### `_apply_labels(df, rng) → DataFrame`
+Applies insight_type and tip_id labels. Distribution: ~60% no_action, ~10% each for spending_spike, subscription, trend_warning, budget_risk. **Crucially adjusts feature values** to be consistent with labels:
+- Spikes get high z-scores (3–5), high deviation, `is_anomaly=1`, higher amounts.
+- Subscriptions get `is_recurring=1`, low z-scores, low deviation, typical subscription amounts (₹99–₹1499).
+- Trend warnings get `rolling_7d_mean > rolling_30d_mean * 1.2`.
+- Budget risk gets elevated z-scores (2–3), moderate deviation.
+- No-action gets benign feature values, all flags cleared.
+
+#### `_add_edge_cases(df, n_edge, rng) → DataFrame`
+Adds 5 categories of deliberately ambiguous samples:
+1. Borderline z-scores (2.8–3.1) → budget_risk.
+2. High z-score but tiny amount (₹10–50) → no_action.
+3. Recurring-looking but high variance → no_action.
+4. Weekend spending spikes → spending_spike.
+5. Low-confidence categorization with anomaly features → spending_spike.
+
+#### `generate_insight_dataset(n_samples, n_edge_cases, test_size, random_state) → Tuple`
+Public API. Returns `(X_train, X_test, y_train, y_test)`. Stratified split on `insight_type`. Logs class distribution.
+
+### Dependencies
+- `config.py` — `CATEGORY_PRIORITY`, `INSIGHT_TYPES`, `TIP_CORPUS`, `lookup_matching_tip_ids`.
+- `numpy`, `pandas`, `sklearn.model_selection`.
 
 ---
 
-## 16. `train_and_save_models.py` (82 lines)
+## 16. `model_benchmark.py` (604 lines)
 
-**Purpose**: Standalone script to train the LightGBM Insight Ranker and serialize it to disk.
+### Purpose
+Trains and evaluates 12 candidate ML models on synthetic data to identify the best architecture for Insight Ranking (5-class) and Tip Selection (~36-class).
 
-### `train_and_save()` (lines 32–78)
-- Generates synthetic data via `generate_insight_dataset()`.
-- Builds sklearn Pipeline: StandardScaler + OneHotEncoder → LGBMClassifier (100 estimators, depth 4, balanced weights).
-- Trains on `insight_type` labels.
-- Saves to `models/insight_ranker.pkl`.
-- Writes SHA-256 checksum to `models/insight_ranker.pkl.sha256`.
+### Model Registry (12 Models)
+`LogisticRegression`, `GradientBoosting`, `RandomForest`, `LinearSVC` (calibrated), `KNeighbors`, `DecisionTree`, `MLPClassifier`, `AdaBoost`, `ExtraTrees`, `XGBoost`, `LightGBM`, `CatBoost`.
 
-**Execution**: `python train_and_save_models.py`
+### Benchmark Structure
+- 2 tasks: Insight Ranker + Tip Selector.
+- 2 variants per task: with/without `is_anomaly` (leakage test).
+- Metrics: CV accuracy, F1 macro/weighted, test accuracy, precision, recall, train time, inference latency (ms/sample), model size (KB), overfit gap.
 
-**Dependencies**: `lightgbm`, `sklearn`, `pickle`, `training_data_generator`, `insight_model`, `schema`.
+### Leakage Detection
+Compares F1 delta between with/without `is_anomaly`. Delta > 0.15 triggers a leakage warning.
+
+### Dependencies
+- `training_data_generator.py` — synthetic data.
+- `sklearn`, `xgboost`, `lightgbm`, `catboost`.
 
 ---
 
-## 17. `model_benchmark.py` (604 lines)
+## 17. `train_and_save_models.py` (82 lines)
 
-**Purpose**: Trains and evaluates 12 candidate ML models to identify the best architecture for insight ranking and tip selection.
+### Purpose
+Trains the production LightGBM Insight Ranker and serializes it to `models/insight_ranker.pkl` with SHA-256 checksum.
 
-### `get_candidate_models()` (lines 97–185)
-- Returns 12 classifiers: LogisticRegression, GradientBoosting, RandomForest, LinearSVC, KNeighbors, DecisionTree, MLP, AdaBoost, ExtraTrees, XGBoost, LightGBM, CatBoost.
+### Function: `train_and_save()`
+1. Generates synthetic data (5000 samples + 500 edge cases).
+2. Builds pipeline: StandardScaler + OneHotEncoder + LGBMClassifier.
+3. Trains on `insight_type`.
+4. Saves pickle to `models/insight_ranker.pkl`.
+5. Writes SHA-256 checksum to `models/insight_ranker.pkl.sha256`.
 
-### `evaluate_model()` (lines 226–315)
-- 5-fold stratified cross-validation + holdout test. Computes: accuracy, F1 (macro/weighted), precision, recall, training time, inference latency, model size, overfit gap.
-
-### `run_benchmark()` (lines 318–367)
-- Runs all 12 models on a given task. Two variants per task: with and without `is_anomaly` feature (leakage test).
-
-### `main()` (lines 480–603)
-- Runs benchmarks for: (1) Insight Ranking (5-class), (2) Tip Selection (~36-class). Prints leaderboards, confusion matrices, feature importances, and leakage check.
-
-**Execution**: `python model_benchmark.py`
-
-**Dependencies**: `sklearn`, `xgboost`, `lightgbm`, `catboost`, `training_data_generator`.
+### Dependencies
+- `training_data_generator.py`, `insight_model.py` (`_compute_checksum`), `schema.py`.
+- `lightgbm`, `sklearn`, `pickle`.
 
 ---
 
 ## 18. `demo.py` (22 lines)
 
-**Purpose**: Minimal example of running the pipeline on a CSV file.
-- Loads `test-data/scrubbed.csv`.
-- Renames columns to match schema.
-- Calls `run_pipeline()`.
-- Prints insights.
+### Purpose
+Minimal usage example. Loads `test-data/scrubbed.csv`, maps bank columns to schema constants, runs `run_pipeline()`, prints insights.
 
 ---
 
 ## 19. `tutorial_real_data.py` (96 lines)
 
-**Purpose**: Tutorial demonstrating how to ingest real bank statements.
-- Supports CSV, JSON, Parquet.
-- Shows column mapping from bank-specific headers to `Col.*` schema.
-- When run as `__main__`, creates a mock CSV, processes it, and cleans up.
+### Purpose
+Demonstrates real bank statement ingestion. Supports CSV, JSON, Parquet. Shows correct column mapping pattern. Includes a self-contained mock data test in `__main__`.
 
 ---
 
-## 20. `fix_detector.py` (6 lines)
+## 20. `requirements.txt` (5 entries)
 
-**Purpose**: One-shot patch script that replaced a threshold condition in `recurring_detector.py` from `if T < 0.3 or A < 0.2:` to `if T == 0.0 or A == 0.0:`.
+```
+pandas==3.0.1
+numpy==2.4.3
+scikit-learn==1.8.0
+lightgbm==4.6.0
+scipy==1.17.1
+```
 
-**OBSERVATION**: This is a legacy artifact — a quick fix applied directly via file manipulation. Should ideally be deleted from the repository.
-
----
-
-## 21–22. `requirements.txt` / `requirements-dev.txt`
-
-**Production**: pandas 3.0.1, numpy 2.4.3, scikit-learn 1.8.0, lightgbm 4.6.0, scipy 1.17.1.
-**Development**: Adds xgboost, catboost, pytest, psutil, joblib, pyarrow, fastparquet, openpyxl.
-
----
-
-## 23. `.gitignore`
-
-Excludes: `.code-review-graph/`, `venv/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`, `catboost_info/`, `models/`, `test-data/`, and various IDE/agent config files.
+Runtime-only. Minimal footprint.
 
 ---
 
-## 24–34. Test Files
+## 21. `requirements-dev.txt` (11 entries)
 
-### `tests/test_phase1.py` (695 lines)
-- **Coverage**: preprocessor (schema validation, flag normalization, signed amount, remark cleaning with 15+ edge cases, zero-drop, dedup, full preprocess), feature_engineer (time features, rolling leakage, z-score safety, full pipeline NaN freedom, inference with backdated/empty history), seed_labeler (keyword matching, priority order, adversarial tiebreaking, coverage, metadata columns).
-
-### `tests/test_phase2.py` (168 lines)
-- **Coverage**: categorization model training/prediction, expected spend model training/prediction, RidgeCV extrapolation verification, percent_deviation safety (no inf for zero/negative expected amounts).
-
-### `tests/test_phase3.py` (206 lines)
-- **Coverage**: recurring detector (monthly detection, frequency None for non-recurring, minimum 3 occurrences, biweekly detection), anomaly composite threshold, insight generator (creates strings, deterministic output, seeded tip selection), PipelineResult immutability.
-
-### `tests/test_e2e.py` (236 lines)
-- Full end-to-end integration: generates 90 days of messy synthetic data (weekly groceries, monthly Netflix, random shopping, one $2500 spike). Validates: PII scrubbing, anomaly detection of the spike, Netflix subscription detection, insight generation. Also tests `run_inference()` with history-aware features.
-
-### `tests/test_ml_integration.py` (67 lines)
-- Tests `load_insight_ranker()` and `predict_insight_scores()` with mock data. Validates graceful fallback when pipeline is None.
-
-### `tests/test_benchmark.py` (282 lines)
-- Validates synthetic data generator: shape, no NaN/inf, distribution ratios, feature-label consistency (spikes have high z-scores, subscriptions have is_recurring=1), tip validity, amount ranges.
-
-### `tests/test_model_security.py` (188 lines)
-- Tests SHA-256 checksum computation/verification, path traversal rejection, symlink resolution, unsigned model rejection, tampered model detection, valid signed model loading.
-
-### `tests/run_smoke.py` (107 lines)
-- Smoke test runner against `test-data/scrubbed.csv`. Prints structured summary of each phase's output.
-
-### `tests/run_stress_heavy.py` (66 lines)
-- Performance stress test: multiplies base data by 10x, 50x, 100x (up to 58,100 rows). Measures throughput (rows/second).
-
-### `tests/run_stress_legacy.py` (92 lines)
-- Legacy stress test on 50,000 synthetic rows. Measures execution time and memory delta using psutil.
-
-### `tests/run_tests_legacy.py` (19 lines)
-- Legacy manual test runner for Phase 1 and Phase 2 test subsets.
+Adds: `xgboost==3.2.0`, `catboost==1.2.10` (benchmarking), `pytest==9.0.2`, `psutil==7.2.2`, `joblib==1.5.3` (testing/profiling), `pyarrow`, `fastparquet`, `openpyxl` (file connectors).

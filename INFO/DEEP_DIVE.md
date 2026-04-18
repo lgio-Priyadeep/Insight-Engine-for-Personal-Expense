@@ -1,660 +1,644 @@
-# Insight Engine — Deep Dive: Complex Architecture Components
+# Insight Engine — Architectural Deep Dives
+**Audience**: Engineers who need to modify, extend, or audit this code.
 
-> **Scope**: All non-obvious design decisions, tricky algorithms, and security mechanisms.
-> **Audience**: Engineers who need to modify, extend, or audit this code.
+
+> Detailed technical explanations of complex subsystems, design decisions,  
+> and non-obvious architectural patterns in the Insight Engine.
 
 ---
 
 ## Table of Contents
 
-1. [Data Leakage Prevention System](#1-data-leakage-prevention-system)
-2. [Merchant Alias Resolution Pipeline](#2-merchant-alias-resolution-pipeline)
-3. [Keyword Priority Tiebreaking Algorithm](#3-keyword-priority-tiebreaking-algorithm)
-4. [Recurring Transaction Scoring Equation](#4-recurring-transaction-scoring-equation)
-5. [Dual-Gate Anomaly Detection](#5-dual-gate-anomaly-detection)
-6. [Insight Diversity Ranking Algorithm](#6-insight-diversity-ranking-algorithm)
-7. [Model Security Architecture](#7-model-security-architecture)
-8. [Inference vs. Training Pipeline Divergence](#8-inference-vs-training-pipeline-divergence)
-9. [Synthetic Data Generator Design](#9-synthetic-data-generator-design)
-10. [PII Scrubbing Strategy](#10-pii-scrubbing-strategy)
-11. [Schema Contract Enforcement](#11-schema-contract-enforcement)
-12. [Memory Optimization Strategies](#12-memory-optimization-strategies)
-13. [Observability Architecture](#13-observability-architecture)
-14. [Identified Technical Debt & Risks](#14-identified-technical-debt--risks)
+1. [Leakage Prevention Architecture](#1-leakage-prevention-architecture)
+2. [Merchant Alias Resolution Strategy](#2-merchant-alias-resolution-strategy)
+3. [Dual-Gate Anomaly Detection](#3-dual-gate-anomaly-detection)
+4. [Recurring Transaction Scoring Model](#4-recurring-transaction-scoring-model)
+5. [Model Security System](#5-model-security-system)
+6. [Insight Ranking: 1−P(no_action) Design](#6-insight-ranking-1pno_action-design)
+7. [Pseudo-Label Tier Disambiguation](#7-pseudo-label-tier-disambiguation)
+8. [History-Aware Inference Pipeline](#8-history-aware-inference-pipeline)
+9. [Training Data Generation Strategy](#9-training-data-generation-strategy)
+10. [Diversity-Preserving Insight Selection](#10-diversity-preserving-insight-selection)
+11. [Schema Contract System](#11-schema-contract-system)
+12. [Structured Logging & Observability](#12-structured-logging--observability)
+13. [Model Persistence & Versioning](#13-model-persistence--versioning)
+14. [Dependency Graph & Coupling Analysis](#14-dependency-graph--coupling-analysis)
 
 ---
 
-## 1. Data Leakage Prevention System
+## 1. Leakage Prevention Architecture
 
-**Location**: `feature_engineer.py`, lines 74–110 (training) and 246–303 (inference)
+### Problem
+In time-series financial data, using future information to compute features for past transactions creates data leakage. A model trained on leaked features performs artificially well during evaluation but fails in production, where future data doesn't exist.
 
-### The Problem
+### Where Leakage Can Occur
 
-In time-series financial data, data leakage occurs when features computed for transaction at time `t` contain information from transactions at time `t` or later. This inflates training metrics and causes catastrophic performance degradation in production.
+| Component | Leakage Vector | Mitigation |
+|-----------|---------------|------------|
+| Rolling features | Row i's rolling window includes row i's own value | `shift(1)` before `.rolling()` |
+| NaN filling | Filling rolling NaN with full-dataset statistics | External `global_mean`/`global_std` injected from training set |
+| Z-score | Using rolling stats that include current row | Z-score uses shifted rolling values |
+| Feature engineering in inference | New transaction sees its own value in rolling computation | `engineer_features_inference` concatenates history first |
 
-### The Solution: Two-Layer Defense
-
-**Layer 1 — Training-Time Shift Gate (`engineer_features`)**
-
-```python
-# feature_engineer.py:89–91
-shifted = df["amount"].shift(1)
-rolling_7d_mean = shifted.rolling(window=7, min_periods=1).mean()
-```
-
-The `shift(1)` call moves every value down by one row. Row `i`'s rolling window now only contains values from rows `0` through `i−1`. The current row's value is NEVER visible to its own features.
-
-**Mathematical proof of correctness**:
-```
-Original:  [100, 200, 300, 400, 500]
-Shifted:   [NaN, 100, 200, 300, 400]
-
-Row 0: rolling(NaN)       = NaN    ← no prior data (correct)
-Row 1: rolling(100)       = 100    ← sees only row 0 (correct)
-Row 2: rolling(100, 200)  = 150    ← sees rows 0,1 (correct)
-Row 3: rolling(100,200,300) = 200  ← sees rows 0,1,2 (correct)
-None of these see their own row's value.
-```
-
-**Layer 2 — Inference-Time History Stitching (`engineer_features_inference`)**
+### Implementation Detail: `shift(1)` + `.rolling()`
 
 ```python
-# feature_engineer.py:268–275
-new_txns["__is_new_txn__"] = True
-history["__is_new_txn__"] = False
-combined = pd.concat([history, new_txns])
-combined = combined.sort_values("date").reset_index(drop=True)
+# feature_engineer.py, line 102
+shifted = df[amount_col].shift(1)
+df[Col.ROLLING_7D_MEAN] = shifted.rolling(window=7, min_periods=1).mean()
 ```
 
-At inference, new transactions are merged with historical data. Rolling features are computed on the combined set (with shift(1)), then only new-transaction rows are extracted via the tag column. This guarantees:
-- New transaction features reflect the ACTUAL historical pattern
-- No future-looking information is included
-- Backdated transactions are handled correctly (the tag column, not position, determines extraction)
+**What happens**:
+- `shift(1)` moves every value one position forward, inserting NaN at index 0.
+- `.rolling(7)` on the shifted series means row i's window covers indices [i-7, i-1] of the original series.
+- Row i's own value is NEVER inside its own window.
 
-**Why NOT use `tail(n)`?** Tag-based extraction handles backdated transactions. If a new transaction's date is earlier than some historical rows, a naive `tail()` would return the wrong rows.
+**Edge case**: For the first row (index 0), `shift(1)` produces NaN. `min_periods=1` allows the rolling computation to proceed with available data, but the result for row 0 is always NaN (no prior data). This NaN is later filled by `fill_rolling_nulls()`.
 
-### NaN Filling Strategy
-
-Early rows lack sufficient history for rolling windows. The pipeline fills these NaNs with **training-set global statistics** (`global_mean`, `global_std`), NOT with test-set or inference-set statistics. This is stored and reused across the training/inference boundary via `InsightModelState`.
-
+### NaN Fill Protocol
 ```python
-# feature_engineer.py:131–143
-df[Col.ROLLING_7D_MEAN] = df[Col.ROLLING_7D_MEAN].fillna(global_mean)
-df[Col.ROLLING_7D_STD]  = df[Col.ROLLING_7D_STD].fillna(safe_std)
-# safe_std = max(abs(global_std), 1.0)  ← prevents div-by-zero downstream
+# feature_engineer.py, line 131-143
+df[col_name] = df[col_name].fillna(global_mean)  # Rolling means
+df[Col.ROLLING_7D_STD] = df[Col.ROLLING_7D_STD].fillna(
+    global_std if global_std and global_std > 0 else 1.0
+)
 ```
+
+The `global_mean` and `global_std` parameters are:
+- **Computed in `pipeline.py`** (line 122-123) from `debits["signed_amount"]` BEFORE any train/test split.
+- **Passed as arguments** to `engineer_features()`. They are NEVER re-derived inside the function.
+- For inference, these come from the stored `InsightModelState`.
+
+This ensures test-set NaN values are filled with training-set statistics, not test-set statistics.
+
+### Why Not Just Use `expanding()`?
+An expanding window naturally avoids leakage, but expanding windows grow indefinitely. In production with months of history, expanding means becomes insensitive to recent behavior changes. A fixed 7-day / 30-day window captures behavioral recency while `shift(1)` prevents leakage.
 
 ---
 
-## 2. Merchant Alias Resolution Pipeline
+## 2. Merchant Alias Resolution Strategy
 
-**Location**: `preprocessor.py`, lines 144–204; `config.py`, lines 15–223
-
-### The Problem
-
-Bank statement remarks are highly inconsistent. `"UPI/9876543210/SWIGGY ORDER 42"`, `"POS SWIGGY-DLY"`, and `"SWIGGY BLR"` should all resolve to `"swiggy"`.
-
-### The Solution: Two-Tier Alias System
-
-**Tier 1 — Specific Merchant Patterns** (early return):
-```python
-# If regex matches AND the alias is NOT a generic router:
-#   Return the canonical merchant name immediately.
-#   Example: r"swiggy" matches → return "swiggy"
+### Problem
+Indian bank statement narrations are deeply polluted. A single Swiggy order might appear as:
+```
+UPI/CR/436928374/Swiggy/8928374928@ybl/HDFC Bank
 ```
 
-**Tier 2 — Generic Router Patterns** (strip and continue):
+This contains: payment router (UPI), reference numbers, merchant name, VPA ID, bank name. Only "Swiggy" has semantic value.
+
+### Two-Phase Resolution Architecture
+
+The system uses a deliberately ordered two-phase approach in `preprocessor.clean_remark()`:
+
+**Phase 1: Specific Merchant Match (170 patterns)**
 ```python
-# If regex matches BUT the alias IS a generic router (UPI, Paytm, PhonePe, etc.):
-#   Strip the matched router text from the remark.
-#   Continue to standard cleanup.
-#   Example: "UPI/1234/RajuTeaStall" → strip "UPI" → clean → "rajuteastall"
+for compiled_re, alias in _COMPILED_SPECIFIC:
+    if compiled_re.search(text):
+        return alias.lower()  # FULL REPLACEMENT + EARLY EXIT
 ```
+- Scans the lowercased raw remark against 170 specific merchant patterns.
+- On FIRST match: returns the canonical alias immediately. The original remark is completely discarded.
+- Order independence: specific merchant names are unique enough that collision between patterns is not a concern.
 
-### How Generic vs. Specific is Determined
-
+**Phase 2: Generic Router Substitution (14 patterns)**
 ```python
-# preprocessor.py:171
-# A pattern is "generic" if its canonical name matches one of:
-_GENERIC_ROUTERS = {"upi transfer", "paytm", "phonepe", "google pay", "bhim", ...}
+for compiled_re, alias in _COMPILED_GENERIC:
+    if compiled_re.search(text):
+        text = compiled_re.sub(" ", text)  # STRIP, don't replace
 ```
+- Only reached if NO specific merchant matched.
+- Strips routing noise (UPI, NEFT, IMPS references) from the text WITHOUT replacing the entire remark.
+- The stripped text then falls through to standard deduplication (email removal, digit removal, noise token removal).
 
-### Dictionary Order Dependency
+### Why Specific Merchants Return Early
 
-The iteration order of `MERCHANT_ALIASES` matters. Python 3.7+ guarantees insertion-order iteration. The config defines specific patterns (like "swiggy") BEFORE generic routers (like "upi"). If a remark contains both `"swiggy"` and `"upi"`, "swiggy" matches first and returns.
+If both "UPI" (generic) and "Swiggy" (specific) appear in a remark, we want "swiggy" as the cleaned output, not the generic UPI routing. The early return ensures the specific merchant identity is preserved.
 
-**Risk**: If `MERCHANT_ALIASES` is ever loaded from a database or JSON without preserving order, this behavior could change. The code does not explicitly enforce ordering.
+### Why Generic Routers Don't Return
 
-### Pre-Compilation for Performance
+If only generic routing appears (e.g., `UPI/CR/436928374/RANDOM_MERCHANT`), returning "UPI Transfer" would destroy the unique merchant identity. Instead, the routing text is stripped, and "RANDOM_MERCHANT" falls through to standard cleaning — preserving whatever merchant-like text remains.
 
-```python
-# preprocessor.py:39–43
-_COMPILED_ALIASES = [
-    (re.compile(pattern, re.IGNORECASE), canonical_name)
-    for pattern, canonical_name in MERCHANT_ALIASES.items()
-]
-```
-
-Regex compilation happens once at import time. This avoids re-compiling ~150 patterns for every single transaction.
+### Compilation Strategy
+All regex patterns are compiled at module load time (`_COMPILED_SPECIFIC`, `_COMPILED_GENERIC`) into lists of `(re.Pattern, str)` tuples. This avoids re-compilation per transaction. With 184 patterns × N transactions, this saves significant CPU time.
 
 ---
 
-## 3. Keyword Priority Tiebreaking Algorithm
+## 3. Dual-Gate Anomaly Detection
 
-**Location**: `seed_labeler.py`, lines 75–106
+### Problem
+Simple z-score thresholding produces false positives: a ₹5 transaction against a ₹2 rolling mean has a high z-score but zero financial significance. Similarly, a large expected-spend residual on a normal-range transaction is likely a model artifact, not a real anomaly.
 
-### The Problem
-
-A remark like `"emi hospital bill ola cab"` matches keywords from three categories:
-- `"emi"` → finance (HIGH priority)
-- `"hospital"` → health (HIGH priority)
-- `"cab"` → transport (MEDIUM priority)
-
-Which category wins?
-
-### The Algorithm
-
-```
-Step 1: Collect ALL keyword matches
-  matches = [
-    CompiledKeyword(text="emi",      category="finance",   priority=3, confidence=0.90),
-    CompiledKeyword(text="hospital", category="health",    priority=3, confidence=0.90),
-    CompiledKeyword(text="cab",      category="transport", priority=2, confidence=0.70),
-  ]
-
-Step 2: Find maximum priority
-  max_priority = 3
-
-Step 3: Filter to only max-priority matches
-  same_tier = [
-    CompiledKeyword(text="emi",      priority=3),
-    CompiledKeyword(text="hospital", priority=3),
-  ]
-
-Step 4: Sort by (keyword_length DESC, keyword_text ASC)
-  sorted = [
-    CompiledKeyword(text="hospital", len=8),  ← longer wins
-    CompiledKeyword(text="emi",      len=3),
-  ]
-
-Step 5: Return first element
-  → category="health", keyword="hospital"
-```
-
-**Why longest keyword?** Longer keywords are more specific. `"cash withdrawal"` (14 chars) is more precise than `"cash"` (4 chars).
-
-**Why alphabetical tiebreak?** Determinism. Without it, same-length keywords could produce different results across runs due to hash-map ordering.
-
-### Priority Tiers
+### Composite Heuristic
 
 ```python
-TIER_MAPPING = {
-    "HIGH":   {"priority": 3, "confidence": 0.90},  # finance, health, utilities
-    "MEDIUM": {"priority": 2, "confidence": 0.70},  # food, transport, shopping, entertainment
-    "LOW":    {"priority": 1, "confidence": 0.50},  # atm, transfer
-}
+is_spike = (
+    (df["amount_zscore"].abs() > zscore_threshold)    # Gate 1
+    & (df["percent_deviation"].abs() > pct_dev_threshold)  # Gate 2
+)
 ```
+
+| Gate | Source | Meaning |
+|------|--------|---------|
+| Z-score > 3.0 | `feature_engineer` → rolling stats | Transaction is statistically unusual relative to recent 7-day spending |
+| Percent deviation > 0.5 | `expected_spend_model` → RidgeCV residual | Transaction amount is 50%+ away from what the ML model expected |
+
+**Both gates must fire simultaneously.** This eliminates:
+- Low-value statistical outliers (Gate 1 fires, Gate 2 doesn't).
+- Model prediction errors on normal transactions (Gate 2 fires, Gate 1 doesn't).
+
+### Why `.abs()` on Both Gates
+The system catches anomalies in BOTH directions:
+- **Positive anomalies**: spending spikes (₹50,000 when norm is ₹5,000).
+- **Negative anomalies**: unusually low spending (₹50 when norm is ₹5,000), which can indicate subscription cancellations or behavioral shifts.
+
+### Division Safety in Percent Deviation
+```python
+# expected_spend_model.py, line 125
+safe_expected = df["expected_amount"].abs().clip(lower=1.0)
+```
+- `abs()` prevents sign inversion when RidgeCV extrapolates a negative expected amount.
+- `clip(lower=1.0)` prevents division by zero when the expected amount is near zero.
+- These edge cases are logged with counts.
 
 ---
 
-## 4. Recurring Transaction Scoring Equation
+## 4. Recurring Transaction Scoring Model
 
-**Location**: `recurring_detector.py`, lines 21–117
+### Problem
+Identifying subscriptions from raw bank data requires distinguishing genuinely recurring charges from coincidental same-merchant purchases. A user might buy from Swiggy 50 times but at random intervals — that's not a subscription.
 
-### The Problem
+### Three-Component Scoring System
 
-Identify subscriptions (Netflix ₹15.99/month) and recurring bills (electricity ~₹800/month) from raw transaction data, without any external subscription database.
+The system evaluates each merchant group on 3 orthogonal dimensions:
 
-### The Scoring Model
-
-For each merchant group with ≥3 transactions:
-
-**1. Amount Score (A)** — How consistent are the amounts?
-```
-amount_drift = max(|amount_i − mean_amount|) / mean_amount  ∀ i
-A = clamp(1.0 − (amount_drift / amount_tolerance), 0.0, 1.0)
-```
-Where `amount_tolerance = 0.20` (20% max variation allowed).
-
-**Example**:
-```
-Amounts: [15.99, 15.99, 15.99]
-mean = 15.99, max_deviation = 0.0
-drift = 0.0, A = 1.0 (perfect)
-
-Amounts: [800, 820, 780]
-mean = 800, max_deviation = 20
-drift = 20/800 = 0.025, A = 1.0 − (0.025/0.20) = 0.875
-```
-
-**2. Temporal Score (T)** — Do the time gaps match a known frequency?
+#### Amount Score (A) — "How stable is the charge?"
 ```python
-RECURRING_CONFIG = {
-    "monthly":   {"min_gap": 27, "max_gap": 33},
-    "weekly":    {"min_gap": 6,  "max_gap": 8},
-    "biweekly":  {"min_gap": 13, "max_gap": 16},
-    "quarterly": {"min_gap": 85, "max_gap": 95},
-}
+amount_drift = (amounts.max() - amounts.min()) / mean_amt
+raw_A = 1.0 - (amount_drift / amount_tolerance)
+A = clamp(raw_A)  # [0, 1]
+```
+- `amount_tolerance = 0.20` (20% drift allowed).
+- Perfect subscription (same amount every time): drift=0, A=1.0.
+- ±20% varying amounts: drift=0.20, A=0.0.
+- Amounts varying > 20%: A=0.0 (clamped).
+
+#### Temporal Score (T) — "How predictable is the timing?"
+```python
+for k, v in RECURRING_CONFIG.items():
+    if v["min_gap"] <= mean_gap <= v["max_gap"]:
+        assigned_freq = v["type"]
+        raw_T = 1.0 - (var / v["var"])
+        break
+T = clamp(raw_T)  # [0, 1]
 ```
 
-```
-mean_gap = mean of time deltas between consecutive transactions (in days)
-If mean_gap ∈ [min_gap, max_gap] for any frequency:
-    gap_variance = std(gaps) / mean_gap
-    T = clamp(1.0 − (gap_variance / allowed_variance), 0.0, 1.0)
-    assigned_frequency = that frequency
-Else:
-    T = 0.0, assigned_frequency = None
-```
+| Frequency | Mean Gap Range | Max Variance |
+|-----------|---------------|--------------|
+| Weekly | 6–8 days | 3 |
+| Biweekly | 13–16 days | 5 |
+| Monthly | 27–33 days | 10 |
+| Quarterly | 85–95 days | 20 |
 
-**3. Volume Score (V)** — How many occurrences?
-```
-V = clamp(n_occurrences / 12, 0.0, 1.0)
-```
-12 = a full year of monthly billing = maximum confidence.
+- If `mean_gap` doesn't fall in any bucket, T=0 and the group is rejected.
+- Low variance (predictable timing) → T ≈ 1.0.
+- High variance (erratic timing) → T → 0.0.
 
-**4. Final Composite Score**:
+#### Volume Score (V) — "How many occurrences?"
+```python
+V = clamp(len(group) / 12.0)  # [0, 1]
 ```
-score = 0.4 × A + 0.4 × T + 0.2 × V
-```
+- 12 occurrences (monthly for a year) = V=1.0.
+- 3 occurrences (minimum threshold) = V=0.25.
+- Acts as a confidence multiplier — more data points = more reliable.
 
-**5. Rejection Gate**:
+#### Final Score and Rejection Logic
 ```python
 if T == 0.0 or A == 0.0:
-    # Reject entirely — not recurring
-    # T=0 means doesn't match any known frequency
-    # A=0 means amounts are wildly inconsistent
+    continue  # REJECT — hard gates
+score = (0.4 * A) + (0.4 * T) + (0.2 * V)
 ```
 
-**6. Confidence Penalty** (amount_drift > 10%):
-```python
-if amount_drift > penalty_threshold:  # 0.10
-    confidence = confidence * (1.0 - amount_drift)
-```
+The weighting `(0.4, 0.4, 0.2)` reflects design intent:
+- Amount stability and temporal regularity are equally important (40% each).
+- Volume is a supporting signal, not a primary one (20%).
+- The hard rejection on T=0 or A=0 prevents wildly varying or randomly timed transactions from sneaking through with a high volume score.
 
 ---
 
-## 5. Dual-Gate Anomaly Detection
-
-**Location**: `anomaly_detector.py`, lines 16–48
-
-### The Problem
-
-A ₹10 coffee might have a z-score of 4.0 if you usually buy ₹5 coffees. That's statistically unusual but financially irrelevant. Conversely, a ₹5000 purchase when your ML model expected ₹4800 has a low z-score but a meaningful deviation — but it's still within normal range.
-
-### The Solution: Two Independent Gates
-
-```
-is_anomaly = (|amount_zscore| > Z_THRESHOLD) AND (|percent_deviation| > D_THRESHOLD)
-```
-
-**Gate 1 — Statistical Z-Score** (from rolling window):
-```
-z = (amount − rolling_7d_mean) / rolling_7d_std
-Threshold: |z| > 3.0
-```
-This catches transactions that deviate from the user's recent spending pattern.
-
-**Gate 2 — ML Deviation** (from RidgeCV expected spend model):
-```
-deviation = (actual − expected) / max(|expected|, 1.0)
-Threshold: |deviation| > 0.5
-```
-This catches transactions that deviate from what the ML model predicts based on temporal features, category, and rolling statistics.
-
-Both must fire. This prevents:
-- Low-value statistical outliers from triggering alerts (Gate 2 filters them)
-- High-value but expected purchases from triggering alerts (Gate 1 filters them)
-
-### Why RidgeCV for Expected Spend (Not Tree-Based)?
-
-`expected_spend_model.py` uses RidgeCV specifically because it can **extrapolate** beyond the training range. Tree-based models (RandomForest, LightGBM) cap predictions at the maximum training value. If a user's purchases suddenly double, a tree model wouldn't predict beyond the historical max. Ridge regression will, enabling meaningful anomaly detection for out-of-distribution amounts.
-
-This design choice is validated in `test_phase2.py:test_expected_spend_model_extrapolates()`.
-
----
-
-## 6. Insight Diversity Ranking Algorithm
-
-**Location**: `insight_generator.py`, lines 118–155
-
-### The Problem
-
-If the top 5 insights by ML score are all spending spikes, the user gets a repetitive output. They should see a mix of insight types.
-
-### The Solution: Type-First Diversity Pass
-
-```
-All candidates: [(type, text, score), ...]
-Sorted by score descending
-
-Pass 1 — Type Seeding:
-  seen_types = set()
-  selected = []
-  for candidate in candidates:
-      if candidate.type not in seen_types:
-          selected.append(candidate)
-          seen_types.add(candidate.type)
-  # After pass 1: At most ONE of each type, always the highest-scoring
-
-Pass 2 — Score Fill:
-  remaining = [c for c in candidates if c not in selected]
-  for candidate in remaining:
-      if len(selected) < top_n:
-          selected.append(candidate)
-
-Final: Sort selected by score descending
-```
-
-**Example**:
-```
-Candidates (sorted by score):
-  1. spending_spike  "₹2500 at Amazon"     score=0.95
-  2. spending_spike  "₹1800 at Flipkart"   score=0.88
-  3. subscription    "Netflix ₹16/month"    score=0.85
-  4. spending_spike  "₹900 at Croma"        score=0.72
-  5. subscription    "Spotify ₹149/month"   score=0.65
-
-Pass 1 (type seeding):
-  → spending_spike: "₹2500 at Amazon" (0.95)
-  → subscription: "Netflix ₹16/month" (0.85)
-
-Pass 2 (fill to top_n=5):
-  → spending_spike: "₹1800 at Flipkart" (0.88)
-  → spending_spike: "₹900 at Croma" (0.72)
-  → subscription: "Spotify ₹149/month" (0.65)
-
-Final (sorted by score):
-  1. ₹2500 at Amazon (0.95)
-  2. ₹1800 at Flipkart (0.88)
-  3. Netflix ₹16/month (0.85)
-  4. ₹900 at Croma (0.72)
-  5. Spotify ₹149/month (0.65)
-```
-
----
-
-## 7. Model Security Architecture
-
-**Location**: `insight_model.py`, lines 40–154
+## 5. Model Security System
 
 ### Threat Model
-
-The pre-trained LightGBM model is loaded via `pickle.load()`. Pickle deserialization is a known Remote Code Execution (RCE) vector. An attacker who swaps the model file can execute arbitrary code.
+The Insight Ranker is loaded from disk via `pickle.load()`, which executes arbitrary Python during deserialization. An attacker who can modify `models/insight_ranker.pkl` achieves Remote Code Execution (RCE).
 
 ### Three-Layer Defense
 
-**Layer 1 — Path Validation** (`_validate_model_path`):
+#### Layer 1: Path Canonicalization
 ```python
-canonical = os.path.realpath(filepath)
-models_dir = os.path.realpath(_MODELS_DIR)
-if not canonical.startswith(models_dir):
-    raise ModelSecurityError("Path resolves outside the allowed models/ directory")
+canonical = os.path.realpath(model_path)
+if not canonical.startswith(models_dir + os.sep):
+    raise ModelSecurityError(...)
 ```
-- Prevents path traversal (`../../etc/passwd`)
-- Resolves symlinks before checking (prevents symlink-based bypass)
-- All model loading is constrained to the `models/` directory
+- Resolves symlinks and `../` sequences.
+- Validates the canonical path is within the `models/` directory.
+- Prevents path traversal attacks where a crafted path like `models/../../etc/malicious.pkl` resolves outside the project.
 
-**Layer 2 — SHA-256 Checksum Verification** (`_verify_checksum`):
+#### Layer 2: SHA-256 Checksum Verification
 ```python
-computed = _compute_checksum(model_path)    # SHA-256 of actual file bytes
-expected = open(checksum_path).read().strip()  # companion .sha256 file
-if computed != expected:
-    raise ModelSecurityError("integrity check FAILED")
+with open(checksum_path, "r") as f:
+    expected = f.read().strip()
+actual = _compute_checksum(model_path)
+if actual != expected:
+    raise ModelSecurityError(...)
 ```
-- Model file must have a companion `.sha256` file written at training time
-- If the model file is modified after training, the checksum won't match
-- Missing checksum file → model rejected gracefully (returns None)
+- A companion `.sha256` file is generated during `train_and_save_models.py`.
+- Before loading, the system recomputes the SHA-256 of the pickle file and compares it against the stored checksum.
+- **Unsigned models are refused** (missing `.sha256` → return None).
+- **Tampered models raise ModelSecurityError** (checksum mismatch → hard stop).
 
-**Layer 3 — Graceful Degradation**:
-```python
-# If no model file exists: return None → fallback to rule-based scoring
-# If checksum missing: return None → refuse to load unsigned model
-# If checksum fails: raise ModelSecurityError → hard stop
-```
+#### Layer 3: Graceful Degradation
+- If the model file is missing entirely: `load_insight_ranker()` returns `None`.
+- `predict_insight_scores()` handles `None` pipeline by defaulting all scores to 0.0.
+- The pipeline continues to function using rule-based insight ordering instead of ML ranking.
 
-### Security Test Coverage
-
-`test_model_security.py` validates:
-- Checksum determinism and hex format
-- Tampered file detection
-- Path traversal rejection
-- Symlink resolution and rejection
-- Missing checksum rejection
-- Valid signed model acceptance
-- Missing file graceful handling
+### Attack Surface Remaining
+- If an attacker can modify BOTH the `.pkl` and `.sha256` files, the checksum validation passes. This defense assumes the checksum file is stored with appropriate filesystem permissions.
+- `pickle.load()` is inherently unsafe. A more secure alternative would be to use ONNX or a safe serialization format for the model weights only, avoiding arbitrary code execution during deserialization.
 
 ---
 
-## 8. Inference vs. Training Pipeline Divergence
+## 6. Insight Ranking: 1−P(no_action) Design
 
-**Location**: `pipeline.py`, lines 93–258
+### Problem
+The insight ranker is a 5-class classifier. How do you convert 5-class probabilities into a single "how insightful is this transaction?" score?
 
-### The Problem
+### Solution: Inverse No-Action Probability
 
-Training (`run_pipeline`) and inference (`run_inference`) share 90% of the same logic but diverge in critical ways. Getting these divergences wrong causes the most insidious production bugs (training/serving skew).
+```python
+classes = list(pipeline.classes_)
+if "no_action" in classes:
+    idx = classes.index("no_action")
+    scores = 1.0 - probs[:, idx]
+```
 
-### Divergence Map
+P(no_action) represents the model's confidence that a transaction warrants NO insight. Therefore:
+- `1 - P(no_action)` = confidence that SOME insight is warranted.
+- Higher score → more interesting transaction.
 
-| Step | Training (`run_pipeline`) | Inference (`run_inference`) |
-|------|---------------------------|-----------------------------|
-| **Preprocessing** | Identical | Identical |
-| **Seed Labeling** | Identical | Identical |
-| **Global Stats** | Computed from current data | Loaded from `InsightModelState` |
-| **Feature Engineering** | `engineer_features(df, gm, gs)` | `engineer_features_inference(new, history, gm, gs)` |
-| **Model Training** | Trains cat, spend, ranker | **Skipped entirely** |
-| **Categorization** | Train + Predict | Predict only (pre-trained pipeline) |
-| **Expected Spend** | Train + Predict | Predict only (pre-trained pipeline) |
-| **Anomaly/Recurring** | Identical | Identical |
-| **Insight Scoring** | Identical | Identical |
-| **Output** | PipelineResult with trained models | PipelineResult with pre-trained models |
+### Why Not Use `probs.max(axis=1)`?
+Using `max(probs)` gives the confidence in the predicted class. But a transaction with P(spending_spike)=0.4, P(subscription)=0.35, P(no_action)=0.25 should rank HIGHER than one with P(no_action)=0.8, P(spending_spike)=0.12. The `max(probs)` approach would give 0.4 vs 0.8, incorrectly ranking the boring transaction higher.
 
-### Critical Design Decision: Feature Engineering Divergence
+`1−P(no_action)` correctly gives: 0.75 (interesting) vs 0.2 (boring).
 
-Training uses `engineer_features()` which operates on the complete dataset (features are computed over all history).
-
-Inference uses `engineer_features_inference()` which stitches new transactions into a historical window. This ensures rolling features for new transactions are computed from real history, not just the new transactions in isolation.
-
-Without this, a single new transaction would have:
-- `rolling_7d_mean = NaN` (no prior rows)
-- `rolling_7d_std = NaN`
-- `amount_zscore = NaN`
-
-These would be filled with `global_mean` — the average of ALL historical amounts — which is a much weaker signal than the actual recent trend.
+### Fallback
+If `no_action` is not in the model's class list (unusual but defensively handled), the system falls back to `probs.max(axis=1)`.
 
 ---
 
-## 9. Synthetic Data Generator Design
+## 7. Pseudo-Label Tier Disambiguation
 
-**Location**: `training_data_generator.py`
+### Problem
+A transaction remark might match multiple keyword categories simultaneously. For example, "cred payment" matches both the `finance` category ("cred") and the `transfer` category ("payment"). Which label wins?
 
-### Purpose
-
-The LightGBM Insight Ranker needs labeled training data, but there are no ground-truth labels. The system uses a synthetic data generator that:
-1. Generates feature vectors mimicking real pipeline output distributions
-2. Assigns labels using rule-based logic that mirrors the insight generator
-3. **Crucially**: Adjusts feature values to be CONSISTENT with labels
-
-### Feature-Label Consistency Enforcement
+### Resolution: Priority Tier System
 
 ```python
-# After assigning "spending_spike" label randomly:
-spike_mask = df["insight_type"] == "spending_spike"
-df.loc[spike_mask, "amount_zscore"] = rng.uniform(3.0, 5.0, size=spike_count)
-df.loc[spike_mask, "is_anomaly"] = 1
-df.loc[spike_mask, "amount"] = rng.lognormal(mean=8.0, sigma=0.8, size=spike_count)
+# seed_labeler.py, _match_remark()
+best_tier = min(m.priority for m in matches)  # LOWEST priority number = HIGHEST rank
+tier_matches = [m for m in matches if m.priority == best_tier]
+tier_matches.sort(key=lambda x: (-len(x.norm), x.norm))  # Longest match, then alphabetic
+best_match = tier_matches[0]
 ```
 
-Without this step, a transaction labeled "spending_spike" might have a z-score of 0.1 and `is_anomaly=False`, confusing the model. The generator ensures features are causally consistent with their labels.
+**Step 1**: Select the tier with the lowest numeric priority (highest semantic priority).
+- `finance` → priority 100 (HIGH_PRIORITY, index 0).
+- `transfer` → priority 301 (LOW_PRIORITY, index 1).
+- Winner: `finance` (priority 100 < 301).
+
+**Step 2**: If multiple matches are in the same tier, select the LONGEST keyword (most specific).
+- "cred payment" vs "cred": "cred payment" (14 chars) > "cred" (4 chars).
+
+**Step 3**: If length ties, break alphabetically (deterministic).
+
+### Confidence Signal
+Each tier has a fixed confidence:
+- HIGH → 1.0 (finance, health, utilities).
+- MEDIUM → 0.8 (food, transport, shopping, entertainment).
+- LOW → 0.6 (atm, transfer).
+- Fallback → 0.0.
+
+This confidence is stored in `label_confidence` and available for downstream analysis but is NOT directly used by the ML models. It serves as metadata for human interpretation and debugging.
+
+---
+
+## 8. History-Aware Inference Pipeline
+
+### Problem
+When a new transaction arrives for real-time scoring, its rolling features (7-day mean, 30-day mean, 7-day std) must reflect the user's actual spending history, not just the single new transaction.
+
+### Tag-Based Row Tracking
+
+```python
+# feature_engineer.py, engineer_features_inference()
+_TAG = "__is_new_txn__"
+hist[_TAG] = False
+new[_TAG] = True
+combined = pd.concat([hist, new], ignore_index=True)
+
+engineered = engineer_features(combined, ...)
+result = engineered[engineered[_TAG]].drop(columns=[_TAG]).reset_index(drop=True)
+```
+
+**Why not use `.tail(n)`?**
+
+`tail(n)` assumes new transactions have the latest dates. But `engineer_features` internally sorts by date. If a new transaction is backdated (e.g., a delayed bank posting from 3 days ago), it sorts into the middle of the combined DataFrame, not at the tail.
+
+The `__is_new_txn__` boolean tag survives through all transformations (sorting, rolling, feature addition). After feature engineering on the combined set, we filter to tagged rows only — extracting exactly the new transactions with correctly computed historical rolling features.
+
+### Memory Behavior
+- `combined` is local to the function and goes out of scope.
+- The tag column is dropped from the result before return.
+- No persistent state is modified.
+
+---
+
+## 9. Training Data Generation Strategy
+
+### Problem
+The Insight Ranker and Tip Selector require labeled training data. Real bank statements are privacy-sensitive. The system must generate realistic synthetic data that mirrors production feature distributions.
+
+### Architecture
+
+```
+_generate_base_features(n, rng)    → 14 feature columns, no labels
+        ↓
+_apply_labels(df, rng)             → Add insight_type + tip_id, adjust features
+        ↓
+_add_edge_cases(df, n_edge, rng)   → 500 deliberately ambiguous samples
+        ↓
+train_test_split(stratify=insight_type)
+```
+
+### Feature Distribution Calibration
+Features are calibrated to match typical Indian bank statement patterns:
+- **Amounts**: Lognormal(μ=6.0, σ=1.2), range ₹10–₹100,000. Median ~₹400.
+- **Category weights**: food 22%, shopping 15%, transport 12%, finance 10%, utilities 10%, etc.
+- **Category confidence**: Beta(5, 2) — skewed toward high confidence, reflecting a well-trained categorizer.
+
+### Label-Feature Consistency
+The system does NOT randomly assign labels independently of features. After assigning labels, it ADJUSTS features to be consistent:
+
+| Label | Feature Adjustments |
+|-------|-------------------|
+| `spending_spike` | z-score ∈ [3, 5], deviation ∈ [0.5, 3], is_anomaly=1, amounts ∈ [₹500, ₹100K] |
+| `subscription` | is_recurring=1, z-score ∈ [-1, 1], deviation ∈ [-0.1, 0.1], amounts ∈ {₹99, ₹149, ..., ₹1499} |
+| `trend_warning` | rolling_7d_mean > rolling_30d_mean × 1.2, z-score ∈ [1, 2.5] |
+| `budget_risk` | z-score ∈ [2, 3], deviation ∈ [0.2, 0.5] |
+| `no_action` | z-score ∈ [-1.5, 1.5], deviation ∈ [-0.2, 0.2], all flags cleared |
+
+This prevents the model from learning contradictions like "is_anomaly=0 but label=spending_spike".
 
 ### Edge Case Augmentation
-
-5 adversarial patterns are injected (~500 samples default):
-1. **Borderline z-scores (2.9–3.1)**: Tests the anomaly decision boundary
-2. **High z-score + tiny amount (<₹50)**: Statistically unusual but trivial — should be no_action
-3. **Recurring-looking + variable amounts**: Looks like subscription but isn't
-4. **Weekend spending spikes**: Context-dependent (food/entertainment on weekends)
-5. **Low-confidence categorization + anomaly features**: Tests robustness to classifier uncertainty
-
-### Indian Market Calibration
-
-Amount distributions use `lognormal(mean=6.0, sigma=1.2)`, centered around ~₹500 with a long tail up to ₹100,000. Category weights reflect typical Indian spending patterns: food 22%, shopping 15%, transport 12%, etc. Subscription amounts include common Indian price points: ₹99, ₹149, ₹199, ₹299, ₹499, ₹799, ₹999, ₹1499.
+500 additional samples stress decision boundaries:
+1. Borderline z-scores (2.8–3.1) → budget_risk, not spike.
+2. High z-score + ₹10 amount → no_action (trivial statistically unusual).
+3. Regular-looking but high variance → no_action (not actually recurring).
+4. Weekend context shifts → spending_spike.
+5. Low-confidence categorization + anomaly signals → spending_spike.
 
 ---
 
-## 10. PII Scrubbing Strategy
+## 10. Diversity-Preserving Insight Selection
 
-**Location**: `preprocessor.py`, lines 144–204 (`clean_remark`)
+### Problem
+If all top-scoring transactions are anomalies, the user sees only spike warnings. If all are subscriptions, they see only recurring charge listings. Neither is useful alone.
 
-### What Gets Removed
+### Two-Pass Selection Algorithm
 
-| Pattern | Example | Rationale |
-|---------|---------|-----------|
-| 4+ digit sequences | `9876543210` | Phone numbers, account numbers, UPI refs |
-| Email addresses | `user@email.com` | Personal identifiers |
-| Special characters | `@`, `#`, `/`, `!` | Structural noise from banking systems |
-| Noise tokens | "payment", "ref", "txn", "cr", "dr" | Generic banking verbiage with no semantic value |
-| Single-character tokens | `a`, `x` | Residual noise after cleaning |
+```python
+# insight_generator.py, generate_human_insights()
 
-### What Gets Preserved
+# Pass 1: Reserve one slot per type
+for cand in candidates:
+    if cand[1] not in seen_types:
+        top_candidates.append(cand)
+        seen_types.add(cand[1])
 
-- Merchant names (via alias resolution or organic text)
-- Numbers with fewer than 4 digits (e.g., "shop 123")
-- Alphanumeric tokens with length ≥ 2
+# Pass 2: Fill remaining quota by absolute score
+for cand in candidates:
+    if len(top_candidates) >= top_n:
+        break
+    if cand not in top_candidates:
+        top_candidates.append(cand)
+```
 
-### Order of Operations
+**Pass 1**: Iterates candidates (sorted by score). For each insight TYPE not yet seen, takes the highest-scoring representative. This guarantees at least one subscription insight and one anomaly insight make it to the final list.
 
-The order matters. Merchant alias matching happens BEFORE PII removal. This ensures patterns like `"NETFLIX.COM SUBSCRIPTION 9876543210"` are resolved to `"netflix"` immediately, without the PII removal potentially corrupting the merchant name.
+**Pass 2**: Fills the remaining `top_n` slots with the absolute highest-scoring candidates regardless of type.
+
+**Final sort**: Re-sorts the selected candidates by ML score for presentation order.
+
+### Example
+Given `top_n=5`:
+- 3 spikes (scores: 0.9, 0.7, 0.6)
+- 2 subscriptions (scores: 0.5, 0.3)
+
+**Without diversity**: [0.9-spike, 0.7-spike, 0.6-spike, 0.5-sub, 0.3-sub]
+**With diversity**: [0.9-spike, 0.5-sub] (Pass 1) → [0.9-spike, 0.7-spike, 0.6-spike, 0.5-sub] (Pass 2) → sorted: [0.9, 0.7, 0.6, 0.5]
+
+The subscription at 0.5 is guaranteed a slot even though three spikes outrank it.
 
 ---
 
-## 11. Schema Contract Enforcement
-
-**Location**: `schema.py`
+## 11. Schema Contract System
 
 ### Design Philosophy
-
-The system uses a **column name contract** pattern. Every column name is a constant on the `Col` class. Every module validates its required columns at entry using `require_columns()`.
-
-### Enforcement Chain
+The `Col` class + `require_columns()` function implement a formal Design by Contract pattern for DataFrames:
 
 ```
-preprocessor.py:274    → require_columns(df, Col.raw_input())
-feature_engineer.py:55 → require_columns(df, Col.feature_engineer_input())
-seed_labeler.py:150    → require_columns(df, Col.seed_labeler_input())
-anomaly_detector.py:25 → require_columns(df, Col.anomaly_detector_input())
+                   ┌─────────────┐
+                   │  schema.py  │
+                   │   Col class │
+                   └──────┬──────┘
+                          │ defines
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+  raw_input()    feature_engineer_input()  ...
+  {date, amount, ...}   {date, amount, signed_amount}
+          │               │
+          ▼               ▼
+  preprocessor      feature_engineer
+  calls require_columns() at entry
 ```
 
-Each `Col.*_input()` method returns a `FrozenSet[str]` — immutable, hashable, and prevents accidental mutation.
+### Why FrozenSet?
+```python
+@staticmethod
+def raw_input() -> FrozenSet[str]:
+    return frozenset({Col.DATE, Col.AMOUNT, Col.AMOUNT_FLAG, Col.REMARKS})
+```
+- `frozenset` is immutable. No caller can accidentally add/remove required columns.
+- Set semantics allow `missing = required - set(df.columns)` for fast validation.
 
-### Type Coercion
+### Contract Enforcement Points
+Every module validates its input contract at function entry, BEFORE any processing:
+```python
+# pattern repeated in every module
+require_columns(df, Col.xxx_input(), "module_name")
+```
 
-`coerce_and_validate_types()` (lines 168–193) uses `pd.to_numeric(errors="coerce")` to handle garbage data in the `amount` column. Unparseable values become NaN, then those rows are dropped and logged. This prevents `ValueError` crashes deep in the pipeline.
+This catches integration errors at the boundary between modules, providing clear error messages with the calling module name and the sorted list of missing/available columns.
 
 ---
 
-## 12. Memory Optimization Strategies
+## 12. Structured Logging & Observability
 
-**Location**: `pipeline.py`, lines 64–71
-
-### Post-Pipeline Optimization
-
-After all ML computations are complete:
-```python
-df["predicted_category"] = df["predicted_category"].astype("category")
-df["is_weekend"] = df["is_weekend"].astype(bool)
+### Architecture
 ```
-
-**Why after, not before?** Some sklearn transformers (especially `ColumnTransformer` with `OneHotEncoder`) don't handle pandas categorical types correctly. The optimization is deferred to avoid breaking the ML pipeline.
-
-### Sparse Matrix Preservation
-
-In `categorization_model.py`:
-```python
-# sparse_threshold=1.0 forces ColumnTransformer to keep output sparse
-ColumnTransformer(..., sparse_threshold=1.0)
-```
-
-TF-IDF produces sparse matrices. Without `sparse_threshold=1.0`, the ColumnTransformer would convert the entire matrix to dense, causing O(n × 2000) memory allocation for every prediction.
-
----
-
-## 13. Observability Architecture
-
-**Location**: `logger_factory.py`
-
-### Structured Logging
-
-Every log message includes:
-```json
-{
-  "timestamp": "2026-04-13T07:00:00.000000+00:00",
-  "level": "INFO",
-  "logger": "preprocessor",
-  "message": "Dropped 3 rows with zero amount",
-  "pipeline_run_id": "run_a1b2c3d4"
+contextvars.ContextVar("pipeline_run_id") ← set once per pipeline invocation
+        ↓
+JSONFormatter.format(record) → {
+    timestamp, level, logger, message,
+    pipeline_run_id,     ← auto-injected
+    event_type,          ← optional, from record
+    metrics              ← optional dict, from record
 }
 ```
 
-### Pipeline Run ID Tracing
-
+### Usage Pattern in Modules
 ```python
-pipeline_run_id_ctx = contextvars.ContextVar("pipeline_run_id", default="UNKNOWN_RUN")
+logger.info(
+    "Preprocessing complete.",
+    extra={
+        "event_type": "preprocessing_complete",
+        "metrics": {"debits_count": len(debits), "credits_count": len(credits)}
+    }
+)
 ```
 
-At the start of `run_pipeline()`, `generate_new_run_id()` creates a unique ID (e.g., `run_a1b2c3d4`) and stores it in a `ContextVar`. Every log message from every module in that execution automatically includes this ID. This enables:
-- Correlating all log messages from a single pipeline run
-- Distinguishing concurrent pipeline executions in multi-threaded deployments
-- Post-mortem debugging by filtering logs on `pipeline_run_id`
+The `extra` dict allows `event_type` and `metrics` to be attached to the log record. `JSONFormatter` checks for these attributes and includes them in the JSON output.
 
-### Event Type & Metrics
-
-Optional structured fields:
+### Run ID Correlation
 ```python
-logger.info("Phase 2 complete", extra={
-    "event_type": "phase_complete",
-    "metrics": {"rows_labeled": 450, "coverage": 0.82}
-})
+# pipeline.py calls at the top:
+generate_new_run_id()
+# → sets pipeline_run_id_ctx to "run_a3f8c2b1"
 ```
+
+Every subsequent log line in that pipeline invocation automatically includes `"pipeline_run_id": "run_a3f8c2b1"`. This enables:
+- Filtering all logs for a specific pipeline run.
+- Correlating errors across modules in the same invocation.
+- Distinguishing interleaved logs from concurrent pipeline runs.
+
+### Handler Configuration
+- `propagate = False`: Each module's logger does NOT forward messages to the root logger, preventing duplicate output when the root logger has its own handler (e.g., in test/notebook environments).
+- `if not logger.handlers`: Guards against duplicate handler attachment when `get_logger()` is called multiple times for the same module name.
 
 ---
 
-## 14. Identified Technical Debt & Risks
+## 13. Model Persistence & Versioning
 
-### Risk 1: Dictionary Order Dependency in Merchant Aliases
-**File**: `preprocessor.py:160–182`
-**Issue**: `clean_remark()` iterates `_COMPILED_ALIASES` in insertion order. Specific merchants MUST appear before generic routers. This is guaranteed by Python 3.7+ CPython dict ordering, but:
-- JSON loading with `json.loads()` preserves order (safe)
-- Database loading may NOT preserve order (unsafe)
-- If `MERCHANT_ALIASES` is ever refactored to a database-backed config, the matching behavior could silently change
-**Recommendation**: Add an explicit `order` field to each alias or sort by specificity at compile time.
+### InsightModelState Container
+```python
+@dataclass
+class InsightModelState:
+    pipeline_version: str         # "1.0.0"
+    cat_pipeline: Optional[Pipeline]
+    spend_pipeline: Optional[Pipeline]
+    ranker_pipeline: Optional[Pipeline]
+    global_mean: float
+    global_std: float
+```
 
-### Risk 2: `fix_detector.py` is a Legacy Artifact
-**File**: `fix_detector.py` (6 lines)
-**Issue**: This is a one-shot patch script that directly manipulates source code via file read/write. It modifies `recurring_detector.py` by replacing a threshold condition. It should not be in the repository.
-**Recommendation**: Delete the file. The fix has already been applied.
+### PII Prevention
+`save_model_state()` explicitly type-checks `global_mean` and `global_std`:
+```python
+if not isinstance(state.global_mean, (float, np.floating)):
+    raise TypeError(...)
+```
+This blocks the scenario where a developer accidentally stores a DataFrame (containing user transactions) as `global_mean`. Only scalar floats are allowed.
 
-### Risk 3: Pickle Deserialization Despite Checksum
-**File**: `insight_model.py:144`
-**Issue**: Even with SHA-256 verification, `pickle.load()` is inherently dangerous. A compromised training pipeline could produce a valid checksum for a malicious model. The system trusts the training pipeline completely.
-**Recommendation**: Consider switching to a safer serialization format (ONNX, joblib with trusted-only mode) or adding allowlist-based pickle unpickling.
+### Version Gate
+```python
+if payload.get("pipeline_version") != "1.0.0":
+    raise ValueError(...)
+```
+Load-time validation ensures the persisted model was generated by a compatible pipeline version. If the feature schema changes in a future version, the version gate prevents loading incompatible models that would produce garbage predictions.
 
-### Risk 4: No Explicit Column Ordering in Feature Matrix
-**File**: `insight_model.py:173–188`
-**Issue**: The `predict_insight_scores()` function passes a DataFrame to `pipeline.predict()`. If the column order in the prediction DataFrame differs from the training DataFrame, some models (especially older versions of XGBoost) may produce incorrect results. The current code relies on the `ColumnTransformer` to handle this via column names, which is safe for sklearn 1.8+ but fragile.
-**Recommendation**: Explicitly reorder columns before prediction.
+### Serialization Format
+Uses `joblib.dump`/`joblib.load` for the model state container (handles sklearn pipelines efficiently with NumPy array serialization). The standalone insight ranker uses `pickle` directly for compatibility with the security checksum system.
 
-### Risk 5: No Rate Limiting on Inference Path
-**File**: `pipeline.py:184–258`
-**Issue**: `run_inference()` has no guard against being called in a tight loop with millions of single-transaction calls. Each call re-executes the full feature engineering pipeline (including history concatenation and rolling computation).
-**Recommendation**: Add batch inference support and/or caching for repeated history windows.
+---
 
-### Risk 6: Hardcoded `pipeline_version = "1.0.0"` in model_state
-**File**: `model_state.py:33`
-**Issue**: `save_model_state()` hardcodes `"1.0.0"` regardless of what `state.pipeline_version` contains. This means the version on the state object is ignored during save.
-**Recommendation**: Use `state.pipeline_version` instead of the hardcoded string, or remove the field from the dataclass if it's always "1.0.0".
+## 14. Dependency Graph & Coupling Analysis
 
-### Risk 7: Non-Deterministic E2E Test
-**File**: `tests/test_e2e.py:66`
-**Issue**: The E2E test uses `np.random.rand()` without a seed for generating random noise transactions. This means the number of random transactions varies per run, which could occasionally cause test flakiness.
-**Recommendation**: Set `np.random.seed()` at the start of the test.
+### Module Dependency DAG
+
+```mermaid
+graph TD
+    config["config.py<br>(0 deps)"]
+    logger["logger_factory.py<br>(0 deps)"]
+    schema["schema.py<br>(logger)"]
+    
+    preproc["preprocessor.py<br>(config, schema, logger)"]
+    feat["feature_engineer.py<br>(schema)"]
+    seed["seed_labeler.py<br>(config, preproc, schema)"]
+    cat["categorization_model.py<br>(config, schema)"]
+    spend["expected_spend_model.py<br>(schema)"]
+    anomaly["anomaly_detector.py<br>(schema)"]
+    recur["recurring_detector.py<br>(config, schema)"]
+    insight_m["insight_model.py<br>(schema)"]
+    insight_g["insight_generator.py<br>(config, schema)"]
+    model_st["model_state.py<br>(0 deps)"]
+    
+    pipeline["pipeline.py<br>(ALL modules)"]
+    
+    config --> preproc
+    config --> seed
+    config --> cat
+    config --> recur
+    config --> insight_g
+    
+    logger --> schema
+    logger --> preproc
+    logger --> pipeline
+    
+    schema --> preproc
+    schema --> feat
+    schema --> seed
+    schema --> cat
+    schema --> spend
+    schema --> anomaly
+    schema --> recur
+    schema --> insight_m
+    schema --> insight_g
+    schema --> pipeline
+    
+    preproc --> seed
+    preproc --> pipeline
+    feat --> pipeline
+    seed --> pipeline
+    cat --> pipeline
+    spend --> pipeline
+    anomaly --> pipeline
+    recur --> pipeline
+    insight_m --> pipeline
+    insight_g --> pipeline
+    model_st --> pipeline
+```
+
+### Coupling Characteristics
+
+| Module | Fan-In | Fan-Out | Assessment |
+|--------|--------|---------|------------|
+| `config.py` | 0 | 5 | Pure data hub. No coupling risk. |
+| `schema.py` | 1 | 9 | Maximally depended upon. Changes here ripple everywhere. |
+| `pipeline.py` | 10 | 0 | Pure consumer. High fan-in is expected for an orchestrator. |
+| `preprocessor.py` | 3 | 2 | Moderate coupling. `seed_labeler` imports `normalize()` directly. |
+| `feature_engineer.py` | 1 | 1 | Well-isolated. Only depends on `schema`. |
+| `anomaly_detector.py` | 1 | 1 | Minimal coupling. Only depends on `schema`. |
+
+### Notable Coupling Point
+`seed_labeler.py` imports `normalize()` from `preprocessor.py`. This creates a dependency from labeling to preprocessing. The function is used as a "boundary hardening measure" — re-normalizing remarks before matching even if they were already cleaned. If `preprocessor.normalize()` changes behavior, it affects both remark cleaning AND keyword matching simultaneously.
+
+### No Circular Dependencies
+The dependency graph is a strict DAG (Directed Acyclic Graph). No module imports from a downstream consumer. `pipeline.py` sits at the top as the sole orchestrator.
