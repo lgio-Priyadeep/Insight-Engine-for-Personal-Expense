@@ -24,7 +24,8 @@ def generate_stress_data(base_df: pd.DataFrame, multiplier: int) -> pd.DataFrame
     return pd.concat(dfs, ignore_index=True)
 
 if __name__ == "__main__":
-    base_df = pd.read_csv("../test-data/scrubbed.csv")
+    base_csv = os.path.join(os.path.dirname(__file__), "..", "test-data", "scrubbed.csv")
+    base_df = pd.read_csv(base_csv)
     
     # 581 rows * 100 = 58,100 rows (~5-10 years of data for a heavy user)
     # We will do 3 tiers: 10x (5.8k), 50x (29k), 100x (58k)

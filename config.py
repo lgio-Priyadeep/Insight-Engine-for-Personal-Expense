@@ -636,3 +636,61 @@ def lookup_matching_tip_ids(category: str, insight_type: str) -> list[str]:
         if len(tip["categories"]) == 0 and insight_type in tip["insights"]
     ]
     return generic
+
+# ===========================================================================
+# KNOWN PERSONS & SELF ACCOUNTS (Exclusion from spend intelligence)
+# ===========================================================================
+
+KNOWN_PERSONS: dict[str, dict] = {
+    # User populates. Empty by default = feature disabled.
+    # "Mom": {
+    #     "names": ["sujata devi", "sujata"],
+    #     "upi_ids": ["sujata@ybl", "9876543210@paytm"],
+    # },
+    "Subho" : {
+        "names" : ["subhadeep saha","subhadeep","subhadeepsaha","mrsubhadeep"],
+        "upi_ids" : []
+    }
+}
+
+
+SELF_ACCOUNTS: dict[str, dict] = {
+    # User populates. Empty by default = feature disabled.
+    # "HDFC_Savings": {
+    #     "names": [],
+    #     "account_fragments": ["50100"],
+    #     "upi_ids": ["myupi@hdfcbank"],
+    # },
+}
+
+# Matching Configuration
+KNOWN_PERSON_MATCH_THRESHOLD = 2
+CONCAT_MIN_LENGTH = 8
+CONCAT_PARTIAL_MIN_LENGTH = 4
+MIN_SPEND_TRANSACTIONS_FOR_ML = 30
+
+# CRITICAL: _MERCHANT_INDICATOR_TOKENS and _MERCHANT_SUFFIXES affect
+# classification correctness, not just heuristics. They are behavioral
+# dependencies. Removing tokens will cause misclassification.
+# See known_persons.py for usage.
+
+# Personal pattern detection (SEPARATE from RECURRING_CONFIG)
+PERSONAL_RECURRING_CONFIG: dict[str, dict] = {
+    "monthly": {
+        "type": "monthly",
+        "min_gap": 22,      # RECURRING_CONFIG uses 27
+        "max_gap": 40,      # RECURRING_CONFIG uses 33
+        "var": 18,          # RECURRING_CONFIG uses 10
+    },
+    "weekly": {
+        "type": "weekly",
+        "min_gap": 5,       # RECURRING_CONFIG uses 6
+        "max_gap": 10,      # RECURRING_CONFIG uses 8
+        "var": 5,           # RECURRING_CONFIG uses 3
+    },
+    "global": {
+        "amount_tolerance": 0.30,      # RECURRING_CONFIG uses 0.20
+        "min_occurrences": 3,          # same
+        "fluctuation_penalty_threshold": 0.20,  # RECURRING_CONFIG uses 0.10
+    }
+}

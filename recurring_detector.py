@@ -32,7 +32,7 @@ def find_recurring_transactions(
     require_columns(df, Col.recurring_detector_input(), "recurring_detector")
     
     # Needs to be sorted chronologically within groups to accurately measure diff
-    df = df.sort_values(by=[Col.DATE]).reset_index(drop=True)
+    df = df.sort_values(by=[Col.DATE])
     
     df[Col.IS_RECURRING] = False
     df[Col.RECURRING_FREQUENCY] = None

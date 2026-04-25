@@ -90,7 +90,7 @@ def add_rolling_features(
         DataFrame with rolling_7d_mean, rolling_30d_mean, rolling_7d_std.
         NaNs are intentionally left for the caller to fill with training stats.
     """
-    df = df.copy().sort_values(Col.DATE).reset_index(drop=True)
+    df = df.copy().sort_values(Col.DATE)
 
     if len(df) <= 1:
         df[Col.ROLLING_7D_MEAN] = np.nan
@@ -226,7 +226,7 @@ def engineer_features(
         )
 
     # Formally enforce chronological sort at the root to prevent any downstream hidden coupling/bleed
-    df = df.copy().sort_values(Col.DATE).reset_index(drop=True)
+    df = df.copy().sort_values(Col.DATE)
 
     df = add_time_features(df)
     df = add_rolling_features(df, amount_col=amount_col)
