@@ -8,6 +8,17 @@ Edit CATEGORY_KEYWORDS to extend or refine keyword matching.
 All keywords are matched against LOWERCASED, CLEANED remarks.
 Multi-word keywords (e.g. "cash withdrawal") are fully supported.
 """
+import os
+
+LOG_LEVEL = os.getenv("INSIGHT_LOG_LEVEL", "INFO").upper()
+VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+if LOG_LEVEL not in VALID_LOG_LEVELS:
+    raise ValueError(f"Invalid LOG_LEVEL: {LOG_LEVEL}")
+
+ENABLE_CRASH_DUMPS = os.getenv("INSIGHT_ENABLE_CRASH_DUMPS", "False").lower() == "true"
+CRASH_DUMP_DIR = os.getenv("INSIGHT_CRASH_DUMP_DIR", "output/crashes")
+ENABLE_PII_DEBUG_LOGS = os.getenv("INSIGHT_ENABLE_PII_DEBUG_LOGS", "False").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Merchant normalisation
