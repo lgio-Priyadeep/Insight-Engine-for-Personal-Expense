@@ -41,8 +41,12 @@ def detect_anomalies(
     
     df[Col.IS_ANOMALY] = is_spike
     
-    anomaly_count = df[Col.IS_ANOMALY].sum()
-    logger.info(f"Anomaly scan complete. Flagged {anomaly_count} transactions.")
+    anomaly_count = int(df[Col.IS_ANOMALY].sum())
+    logger.info(
+        "Anomaly scan complete. Flagged %d transactions.", 
+        anomaly_count,
+        extra={"event_type": "anomaly_detection_metrics", "stage": "phase_5"}
+    )
 
     return df
 

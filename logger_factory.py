@@ -4,14 +4,17 @@ import contextvars
 import uuid
 from datetime import datetime, timezone
 
+import config
+
 # Context variable to hold the pipeline_run_id seamlessly across the module
-pipeline_run_id_ctx = contextvars.ContextVar("pipeline_run_id", default="UNKNOWN_RUN")
+pipeline_run_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pipeline_run_id",
+    default="no_pipeline_context"
+)
 
 def generate_new_run_id() -> str:
-    """Generate and set a new pipeline_run_id in the current context."""
-    run_id = f"run_{uuid.uuid4().hex[:8]}"
-    pipeline_run_id_ctx.set(run_id)
-    return run_id
+    """Generate a new pipeline_run_id."""
+    return str(uuid.uuid4())
 
 class JSONFormatter(logging.Formatter):
     """
@@ -19,22 +22,20 @@ class JSONFormatter(logging.Formatter):
     Injects contextvars and explicitly provided kwargs nicely.
     """
     def format(self, record):
+        exc_type = record.exc_info[0] if record.exc_info else None
         log_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
+            "event_type": getattr(record, "event_type", "unspecified_event"),
             "pipeline_run_id": pipeline_run_id_ctx.get(),
+            "stage": getattr(record, "stage", "unknown_stage"),
+            "message": record.getMessage(),
+            "error_type": exc_type.__name__ if exc_type else None,
+            "traceback": self.formatException(record.exc_info) if record.exc_info else None,
         }
 
-        if hasattr(record, "event_type"):
-            log_record["event_type"] = record.event_type
-        
         if hasattr(record, "metrics"):
             log_record["metrics"] = record.metrics
-            
-        if record.exc_info:
-            log_record["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(log_record)
 
@@ -49,7 +50,7 @@ def get_logger(name: str) -> logging.Logger:
         handler = logging.StreamHandler()
         handler.setFormatter(JSONFormatter())
         logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(getattr(logging, config.LOG_LEVEL))
         logger.propagate = False  # Prevent firing to root logger which might be basic text
         
     return logger

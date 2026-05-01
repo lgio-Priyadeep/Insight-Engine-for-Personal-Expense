@@ -75,3 +75,5 @@ models/
 # Test data 
 test-data/
 
+#Output folder
+output/

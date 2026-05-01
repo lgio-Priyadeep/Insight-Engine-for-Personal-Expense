@@ -16,6 +16,8 @@ class InsightModelState:
     ranker_pipeline: Optional[SklearnPipeline]
     global_mean: float
     global_std: float
+    stats_version: str = "v1_raw"
+    kp_config_hash: str = ""
 
 def save_model_state(filepath: str, state: InsightModelState) -> None:
     """
@@ -36,6 +38,8 @@ def save_model_state(filepath: str, state: InsightModelState) -> None:
         "ranker_pipeline": state.ranker_pipeline,
         "global_mean": float(state.global_mean),
         "global_std": float(state.global_std),
+        "stats_version": state.stats_version,
+        "kp_config_hash": state.kp_config_hash,
     }
 
     joblib.dump(payload, filepath)
@@ -56,4 +60,6 @@ def load_model_state(filepath: str) -> InsightModelState:
         ranker_pipeline=payload["ranker_pipeline"],
         global_mean=payload["global_mean"],
         global_std=payload["global_std"],
+        stats_version=payload.get("stats_version", "v1_raw"),
+        kp_config_hash=payload.get("kp_config_hash", ""),
     )

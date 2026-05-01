@@ -30,6 +30,7 @@ logger = logging.getLogger("e2e_test")
 
 def test_run_e2e_test():
     logger.info("Starting E2E Rigorous Validation Pipeline...")
+    np.random.seed(42)
 
     # 1. Create Raw Messy Data (Similar to bank extracts)
     base_date = datetime(2023, 1, 1)
@@ -155,6 +156,8 @@ def test_run_inference_uses_history_features():
     from pipeline import run_pipeline, run_inference
     from schema import Col
 
+    np.random.seed(42)
+
     # Build 90-day history
     base_date = datetime(2023, 1, 1)
     dates, amounts, flags, remarks = [], [], [], []
@@ -197,6 +200,8 @@ def test_run_inference_uses_history_features():
         ranker_pipeline=baseline_result.ranker_pipeline,
         global_mean=baseline_result.global_mean,
         global_std=baseline_result.global_std,
+        stats_version=baseline_result.stats_version,
+        kp_config_hash=baseline_result.kp_config_hash,
     )
 
     # 3. Inference WITH history

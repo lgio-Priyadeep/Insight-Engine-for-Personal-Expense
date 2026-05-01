@@ -8,6 +8,17 @@ Edit CATEGORY_KEYWORDS to extend or refine keyword matching.
 All keywords are matched against LOWERCASED, CLEANED remarks.
 Multi-word keywords (e.g. "cash withdrawal") are fully supported.
 """
+import os
+
+LOG_LEVEL = os.getenv("INSIGHT_LOG_LEVEL", "INFO").upper()
+VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+if LOG_LEVEL not in VALID_LOG_LEVELS:
+    raise ValueError(f"Invalid LOG_LEVEL: {LOG_LEVEL}")
+
+ENABLE_CRASH_DUMPS = os.getenv("INSIGHT_ENABLE_CRASH_DUMPS", "False").lower() == "true"
+CRASH_DUMP_DIR = os.getenv("INSIGHT_CRASH_DUMP_DIR", "output/crashes")
+ENABLE_PII_DEBUG_LOGS = os.getenv("INSIGHT_ENABLE_PII_DEBUG_LOGS", "False").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Merchant normalisation
@@ -636,3 +647,59 @@ def lookup_matching_tip_ids(category: str, insight_type: str) -> list[str]:
         if len(tip["categories"]) == 0 and insight_type in tip["insights"]
     ]
     return generic
+
+# ===========================================================================
+# KNOWN PERSONS & SELF ACCOUNTS (Exclusion from spend intelligence)
+# ===========================================================================
+
+KNOWN_PERSONS: dict[str, dict] = {
+    # User populates. Empty by default = feature disabled.
+    #  Example:
+    #  "Mom": {
+    #     "names": ["sujata devi", "sujata"],
+    #     "upi_ids": ["sujata@ybl", "9876543210@paytm"],
+    # },
+    
+}
+
+
+SELF_ACCOUNTS: dict[str, dict] = {
+    # User populates. Empty by default = feature disabled.
+    # "HDFC_Savings": {
+    #     "names": [],
+    #     "account_fragments": ["50100"],
+    #     "upi_ids": ["myupi@hdfcbank"],
+    # },
+}
+
+# Matching Configuration
+KNOWN_PERSON_MATCH_THRESHOLD = 2
+CONCAT_MIN_LENGTH = 8
+CONCAT_PARTIAL_MIN_LENGTH = 4
+MIN_SPEND_TRANSACTIONS_FOR_ML = 30
+
+# CRITICAL: _MERCHANT_INDICATOR_TOKENS and _MERCHANT_SUFFIXES affect
+# classification correctness, not just heuristics. They are behavioral
+# dependencies. Removing tokens will cause misclassification.
+# See known_persons.py for usage.
+
+# Personal pattern detection (SEPARATE from RECURRING_CONFIG)
+PERSONAL_RECURRING_CONFIG: dict[str, dict] = {
+    "monthly": {
+        "type": "monthly",
+        "min_gap": 22,      # RECURRING_CONFIG uses 27
+        "max_gap": 40,      # RECURRING_CONFIG uses 33
+        "var": 18,          # RECURRING_CONFIG uses 10
+    },
+    "weekly": {
+        "type": "weekly",
+        "min_gap": 5,       # RECURRING_CONFIG uses 6
+        "max_gap": 10,      # RECURRING_CONFIG uses 8
+        "var": 5,           # RECURRING_CONFIG uses 3
+    },
+    "global": {
+        "amount_tolerance": 0.30,      # RECURRING_CONFIG uses 0.20
+        "min_occurrences": 3,          # same
+        "fluctuation_penalty_threshold": 0.20,  # RECURRING_CONFIG uses 0.10
+    }
+}
