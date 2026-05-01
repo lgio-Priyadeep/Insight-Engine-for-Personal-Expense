@@ -5,7 +5,7 @@ from pipeline import run_pipeline
 from summary_utils import print_summary
 
 # 1. Load your raw bank statement
-my_data = pd.read_csv("test-data/scrubbed.csv")
+my_data = pd.read_csv("path/to/data.csv")
 
 # 2. Map your columns to the strict Schema
 my_data = my_data.rename(columns={

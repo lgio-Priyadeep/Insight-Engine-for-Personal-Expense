@@ -654,14 +654,12 @@ def lookup_matching_tip_ids(category: str, insight_type: str) -> list[str]:
 
 KNOWN_PERSONS: dict[str, dict] = {
     # User populates. Empty by default = feature disabled.
-    # "Mom": {
+    #  Example:
+    #  "Mom": {
     #     "names": ["sujata devi", "sujata"],
     #     "upi_ids": ["sujata@ybl", "9876543210@paytm"],
     # },
-    "Subho" : {
-        "names" : ["subhadeep saha","subhadeep","subhadeepsaha","mrsubhadeep"],
-        "upi_ids" : []
-    }
+    
 }
 
 
