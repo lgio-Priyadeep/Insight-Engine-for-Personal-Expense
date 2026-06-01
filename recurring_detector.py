@@ -8,16 +8,15 @@ Current Logic leverages deterministic scaled scoring equations:
 score = 0.4*A + 0.4*T + 0.2*V
 """
 
-import logging
 import pandas as pd
 import numpy as np
 
 import config
 from config import RECURRING_CONFIG
 from schema import Col, require_columns
-from hash_utils import stable_hash
-
-logger = logging.getLogger(__name__)
+from log_utils import log_safe_merchant
+from logger_factory import get_logger
+logger = get_logger(__name__)
 
 
 def find_recurring_transactions(
@@ -90,7 +89,7 @@ def find_recurring_transactions(
         V = clamp(len(group) / 12.0) # Assume 12 is a perfect solid year of hits
         
         if T == 0.0 or A == 0.0:
-            merchant_ref = identifier if config.ENABLE_PII_DEBUG_LOGS else stable_hash(identifier)
+            merchant_ref = identifier if config.ENABLE_PII_DEBUG_LOGS else log_safe_merchant(identifier)
             logger.debug(
                 "Rejected recurring pattern for %s: A=%.2f, T=%.2f",
                 merchant_ref, A, T,
@@ -99,7 +98,7 @@ def find_recurring_transactions(
             continue
 
         score = (0.4 * A) + (0.4 * T) + (0.2 * V)
-        merchant_ref = identifier if config.ENABLE_PII_DEBUG_LOGS else stable_hash(identifier)
+        merchant_ref = identifier if config.ENABLE_PII_DEBUG_LOGS else log_safe_merchant(identifier)
         logger.debug(
             "Assessed recurring transaction pattern for %s. Components -> A:%.2f, T:%.2f, V:%.2f, Final:%.2f",
             merchant_ref, A, T, V, score,

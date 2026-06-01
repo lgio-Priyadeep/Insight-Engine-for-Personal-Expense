@@ -94,6 +94,10 @@ class Col:
     TIP_ID = "tip_id"
     INSIGHT_SCORE = "insight_score"
 
+    # ── Passion Engine: Subcategory Inference ─────────────────────────────
+    INFERRED_SUBCATEGORY   = "inferred_subcategory"
+    SUBCATEGORY_CONFIDENCE = "subcategory_confidence"
+
     # ══════════════════════════════════════════════════════════════════════
     # Required Column Sets — Module Input Contracts
     # ══════════════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@ insight_generator.py — Natural Language Translator
 Reads flags generated across the ML Insight Engine and packages them
 into human-understandable spending optimization strings.
 
-Tips are sourced from TIP_CORPUS in config.py — no hardcoded tip text.
+Tips are sourced from TIP_CORPUS in contracts.py — no hardcoded tip text.
 
 Reproducibility:
     All random selections use a seeded random.Random() instance.
@@ -13,45 +13,37 @@ Reproducibility:
 
 import logging
 import random as _random_module
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 
-from config import TIP_CORPUS, INSIGHT_TEMPLATES, lookup_matching_tip_ids
+from contracts import TIP_CORPUS, INSIGHT_TEMPLATES, lookup_matching_tip_ids
 from schema import Col, require_columns
 
 logger = logging.getLogger(__name__)
 
 
-def _select_tip(
-    category: str,
-    insight_type: str,
-    rng: Optional[_random_module.Random] = None,
-) -> str:
-    """
-    Select a tip text for a (category, insight_type) pair from TIP_CORPUS.
+def _select_tip(category: str, insight_type: str, rng: _random_module.Random) -> str:
+    """Select a random tip matching category and insight type."""
+    try:
+        tip_ids = lookup_matching_tip_ids(category, insight_type)
+    except (KeyError, TypeError, IndexError, ValueError) as e:
+        logger.warning(
+            "tip_lookup_failed",
+            extra={
+                "category": category,
+                "insight_type": insight_type,
+                "error_type": type(e).__name__,
+            },
+        )
+        return ""
 
-    Uses the shared ``lookup_matching_tip_ids`` helper for the 2-pass
-    category-specific → generic lookup, then randomly selects from
-    matching tip texts.
-
-    Args:
-        category:     Transaction category (e.g. "food").
-        insight_type: Insight class (e.g. "spending_spike").
-        rng:          Seeded random.Random instance for deterministic selection.
-                      If None, creates one with default seed 42.
-
-    Returns:
-        Tip text string, or empty string if no match.
-    """
-    if rng is None:
-        rng = _random_module.Random(42)
-
-    tip_ids = lookup_matching_tip_ids(category, insight_type)
     if not tip_ids:
         return ""
-    texts = [TIP_CORPUS[tid]["text"] for tid in tip_ids]
-    return rng.choice(texts)
+
+    tip_id = rng.choice(tip_ids)
+    tip_data = TIP_CORPUS.get(tip_id, {})
+    return tip_data.get("text", "") if tip_data else ""
 
 
 def generate_human_insights(
@@ -64,7 +56,7 @@ def generate_human_insights(
     summaries representing anomalous and recurring transaction signals,
     ranked by the LightGBM Insight Ranker.
 
-    Tips are selected from the curated TIP_CORPUS in config.py.
+    Tips are selected from the curated TIP_CORPUS in contracts.py.
 
     Args:
         df:    Fully enriched DataFrame from the pipeline.

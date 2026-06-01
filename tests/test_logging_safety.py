@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import importlib
 import logging
@@ -8,8 +9,8 @@ import pandas as pd
 from pipeline import run_pipeline, generate_new_run_id
 from recurring_detector import find_recurring_transactions
 import config
-from hash_utils import stable_hash
-
+import logger_factory
+from log_utils import log_safe_merchant
 from schema import Col
 
 @pytest.fixture
@@ -120,21 +121,45 @@ def test_invalid_log_level(monkeypatch):
     with pytest.raises(ValueError, match="Invalid LOG_LEVEL: GARBAGE"):
         importlib.import_module("config")
 
-def test_pii_redaction_coverage(monkeypatch, caplog):
+def test_pii_redaction_coverage(monkeypatch, capsys):
     """Test 5: Validating deterministic logging paths apply proper data transforms preventing state leakage."""
-    # Ensure PII logs are disabled naturally as they are in production bounds
     monkeypatch.setattr(config, "ENABLE_PII_DEBUG_LOGS", False)
-    
-    # Generate bounded synthetic data representing sensitive information payload
-    df = pd.DataFrame({
-        Col.CLEANED_REMARKS: ["Netflix", "Netflix", "Netflix"], 
-        Col.DATE: pd.date_range("2023-01-01", periods=3), 
-        Col.AMOUNT: [10.0, 10.0, 10.0]
-    })
-    
-    # Observe output scope securely
-    with caplog.at_level(logging.DEBUG, logger="recurring_detector"):
+
+    # Force logger_factory's logger down to DEBUG so the HMAC token line is emitted.
+    logger = logger_factory.get_logger("recurring_detector")
+    logger.setLevel(logging.DEBUG)
+
+    # StreamHandler captures sys.stderr at handler-creation time (before pytest swaps it
+    # for capsys's buffer). Save originals, re-point to sys.stderr so capsys intercepts,
+    # then restore unconditionally in finally to prevent test state leak.
+    import sys as _sys
+    original_streams = {h: h.stream for h in logger.handlers if isinstance(h, logging.StreamHandler)}
+    for handler in original_streams:
+        handler.stream = _sys.stderr
+
+    try:
+        df = pd.DataFrame({
+            Col.CLEANED_REMARKS: ["Netflix", "Netflix", "Netflix"],
+            Col.DATE: pd.date_range("2023-01-01", periods=3),
+            Col.AMOUNT: [10.0, 10.0, 10.0]
+        })
+
         find_recurring_transactions(df, group_col=Col.CLEANED_REMARKS)
-        
-    assert not any("Netflix" in msg for msg in caplog.messages)
-    assert any(stable_hash("Netflix") in msg for msg in caplog.messages)
+
+        captured = capsys.readouterr()
+        messages = []
+        for line in captured.err.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                messages.append(json.loads(line).get("message", ""))
+            except json.JSONDecodeError:
+                messages.append(line)
+
+        assert not any("Netflix" in msg for msg in messages)
+        assert any(log_safe_merchant("Netflix") in msg for msg in messages)
+    finally:
+        for handler, stream in original_streams.items():
+            handler.stream = stream
+

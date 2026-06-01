@@ -1,0 +1,14 @@
+[project]
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+log_cli_level = "INFO"
+filterwarnings = [
+    # FIX 20: Do not globally error every UserWarning
+    "error::RuntimeWarning",
+    "default::DeprecationWarning",
+    "default::FutureWarning",
+    "default::PendingDeprecationWarning",
+    "ignore::RuntimeWarning:numpy",
+    "ignore::UserWarning:pandas",
+]

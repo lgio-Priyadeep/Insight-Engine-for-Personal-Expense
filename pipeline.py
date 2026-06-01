@@ -42,6 +42,17 @@ from known_persons import (
 )
 
 logger = get_logger(__name__)
+# FIX #1: passion_logger MUST be at module scope before _attach_passion_results.
+# Do NOT shadow the existing pipeline-level logger — use a distinct name.
+from logger_factory import get_logger
+passion_logger = get_logger("passion.engine")
+# Standard Python logger for pytest caplog interception (caplog cannot see
+# the custom JSON-to-stderr emitter used by passion_logger / get_logger).
+# IMPORTANT: must NOT be under __name__ namespace — get_logger(__name__) sets
+# propagate=False on that logger (and all children), making it invisible to caplog.
+# 'insight_engine.caplog_bridge' is independent: its parent is root (propagate=True).
+import logging as _std_logging
+_std_logger = _std_logging.getLogger("insight_engine.caplog_bridge")
 
 
 def _compute_config_hash(kp: dict, sa: dict) -> str:
@@ -81,10 +92,33 @@ def _validate_state_version(
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class PipelineResult:
     """
-    Immutable container for the full pipeline output.
+    D4 — passion_debits vs debits Contract
+    ──────────────────────────────────────
+    result.debits:
+        Core pipeline output. Contains all ML-enriched columns produced by
+        run_pipeline / run_inference (predicted_category, insight_score,
+        is_anomaly, is_recurring, etc.). This field is NEVER mutated by the
+        passion sidecar. Downstream consumers that only need core ML output
+        should read result.debits.
+
+    result.passion_debits:
+        passion_debits is produced by running the passion sidecar against
+        result.debits and returning a defensive-copy DataFrame with the
+        same rows plus passion-owned columns added:
+          - Col.INFERRED_SUBCATEGORY ("inferred_subcategory")
+          - Col.SUBCATEGORY_CONFIDENCE ("subcategory_confidence")
+        Populated only when INSIGHT_ENGINE_PASSION_ENABLED=true and the
+        passion engine runs successfully. Defaults to empty DataFrame.
+        Downstream consumers needing subcategory enrichment MUST read
+        passion_debits, not debits.
+
+    DESIGN NOTE: If product requirements change to expect enriched subcategory
+    data in result.debits (not passion_debits), that is a deliberate design
+    change requiring a separate migration — it must NOT be done by mutating
+    result.debits inside _attach_passion_results.
     """
     debits: pd.DataFrame
     credits: pd.DataFrame
@@ -98,11 +132,60 @@ class PipelineResult:
     raw_global_std: float = 0.0
     stats_version: str = "v1_raw"
     personal_summary: dict = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
+    passion_debits: pd.DataFrame = field(default_factory=pd.DataFrame)
+    passion_insights: tuple = field(default=())
+    passion_signals: tuple = field(default=())
     transfer_patterns: list = field(default_factory=list)
     exclusion_stats: dict = field(default_factory=dict)
     kp_config_hash: str = ""
     personal_debits: pd.DataFrame = field(default_factory=pd.DataFrame)
     personal_credits: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    def __post_init__(self) -> None:
+        if hasattr(self, "passion_debits") and isinstance(self.passion_debits, pd.DataFrame):
+            object.__setattr__(self, "passion_debits", self.passion_debits.copy(deep=True))
+
+        if hasattr(self, "stats") and isinstance(self.stats, dict):
+            # FIX-5: Validate that all stats dictionary keys and values are scalars to prevent deep nested mutation.
+            import numpy as np
+            _allowed_scalar_types = (str, int, float, bool, bytes, type(None), np.generic)
+            for k, v in self.stats.items():
+                if not isinstance(k, _allowed_scalar_types):
+                    raise TypeError(f"stats key must be scalar, got {type(k).__name__}")
+                if not isinstance(v, _allowed_scalar_types):
+                    raise TypeError(f"stats value for key '{k}' must be scalar, got {type(v).__name__}")
+            object.__setattr__(self, "stats", dict(self.stats))
+
+        # P2-1: Passion field normalization and type validation
+        object.__setattr__(self, "passion_insights",
+            tuple(self.passion_insights) if self.passion_insights is not None else ()
+        )
+        object.__setattr__(self, "passion_signals",
+            tuple(self.passion_signals) if self.passion_signals is not None else ()
+        )
+
+        # B1: Do NOT import passion_models unconditionally here.
+        # An unconditional 'from passion_models import PassionSignal' makes the
+        # optional Passion sidecar structurally mandatory for every core pipeline
+        # import. Use duck-typing instead: check for required PassionSignal
+        # attributes only when passion_signals is non-empty.
+        for s in self.passion_signals:
+            if not (
+                hasattr(s, 'category') and
+                hasattr(s, 'spend_share') and
+                hasattr(s, 'is_suppressed') and
+                hasattr(s, 'merchant_list')
+            ):
+                raise TypeError(
+                    f"passion_signals elements must be PassionSignal-like "
+                    f"(have category, spend_share, is_suppressed, merchant_list), "
+                    f"got {type(s)}"
+                )
+
+        for t in self.passion_insights:
+            if not isinstance(t, str):
+                raise TypeError(f"passion_insights must contain str, got {type(t)}")
 
     def replace(self, **kwargs) -> "PipelineResult":
         import dataclasses
@@ -155,6 +238,332 @@ def _pre_initialize_ml_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = pd.NA
     return df
+
+# ── Passion Engine Integration Helpers ────────────────────────────────
+# FIX-01: Shared helper for both run_pipeline and run_inference.
+# FIX-33: Checks PASSION_ENGINE_ENABLED kill switch at runtime.
+# FIX C9/C10: Lazy-import patching to prevent circular dependencies.
+
+def _write_crash_dumps(
+    *,
+    debits,
+    credits,
+    crash_dump_dir,
+    passion_debits=None,
+    passion_insights=(),
+    passion_signals=(),
+    run_id=None,
+) -> bool:
+    """Safely write crash dump files containing debits, credits, and passion data."""
+    import os
+    import json
+    import numpy as np
+    import pandas as pd
+    import config
+    from logger_factory import get_logger, pipeline_run_id_ctx
+    from schema import Col
+
+    logger = get_logger(__name__)
+
+    if not run_id:
+        run_id = pipeline_run_id_ctx.get() or "unknown"
+
+    os.makedirs(crash_dump_dir, exist_ok=True)
+    wrote_any = False
+
+    if debits is not None and not isinstance(debits, pd.DataFrame):
+        logger.warning(
+            "Unexpected type for debits: %s",
+            type(debits).__name__,
+            extra={"event_type": "data_corruption", "stage": "crash_handler"}
+        )
+    safe_debits = debits.head(1000) if isinstance(debits, pd.DataFrame) else pd.DataFrame()
+
+    if credits is not None and not isinstance(credits, pd.DataFrame):
+        logger.warning(
+            "Unexpected type for credits: %s",
+            type(credits).__name__,
+            extra={"event_type": "data_corruption", "stage": "crash_handler"}
+        )
+    safe_credits = credits.head(1000) if isinstance(credits, pd.DataFrame) else pd.DataFrame()
+
+    # Safely handle new passion fields
+    safe_passion_debits = pd.DataFrame()
+    passion_summary = {}
+
+    if passion_debits is not None and isinstance(passion_debits, pd.DataFrame):
+        safe_passion_debits = passion_debits.head(1000)
+
+    if passion_insights is not None:
+        _raw_insights = list(passion_insights)[:100]
+        if getattr(config, "ENABLE_PII_DEBUG_LOGS", False):
+            passion_summary["insights"] = _raw_insights
+        else:
+            from log_utils import log_safe_text
+            passion_summary["insights"] = [log_safe_text(str(x)) for x in _raw_insights]
+
+    if passion_signals is not None:
+        signals_serial = []
+        from log_utils import log_safe_merchant
+        for sig in list(passion_signals)[:100]:
+            masked_merchants = [
+                log_safe_merchant(m) if not getattr(config, "ENABLE_PII_DEBUG_LOGS", False) else m
+                for m in sig.merchant_list
+            ]
+            signals_serial.append({
+                "category": sig.category,
+                "total_spend": sig.total_spend,
+                "merchant_count": sig.merchant_count,
+                "spend_share": sig.spend_share,
+                "trend_direction": sig.trend_direction,
+                "is_suppressed": sig.is_suppressed,
+                "suppression_reason": sig.suppression_reason,
+                "latest_ts": sig.latest_ts,
+                "merchant_list": masked_merchants,
+            })
+        passion_summary["signals"] = signals_serial
+
+    # Atomicity Note: Guaranteed on POSIX systems; best-effort on Windows.
+    if not safe_debits.empty:
+        wrote_any = True
+        tmp_path = os.path.join(crash_dump_dir, f"{run_id}_debits.csv.tmp")
+        final_path = os.path.join(crash_dump_dir, f"{run_id}_debits.csv")
+        safe_debits.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, final_path)
+
+    if not safe_credits.empty:
+        wrote_any = True
+        tmp_path = os.path.join(crash_dump_dir, f"{run_id}_credits.csv.tmp")
+        final_path = os.path.join(crash_dump_dir, f"{run_id}_credits.csv")
+        safe_credits.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, final_path)
+
+    if not safe_passion_debits.empty:
+        wrote_any = True
+        tmp_path = os.path.join(crash_dump_dir, f"{run_id}_passion_debits.csv.tmp")
+        final_path = os.path.join(crash_dump_dir, f"{run_id}_passion_debits.csv")
+        from log_utils import log_safe_merchant
+        pii_safe_passion_debits = safe_passion_debits.copy()
+        if Col.CLEANED_REMARKS in pii_safe_passion_debits.columns and not getattr(config, "ENABLE_PII_DEBUG_LOGS", False):
+            pii_safe_passion_debits[Col.CLEANED_REMARKS] = pii_safe_passion_debits[Col.CLEANED_REMARKS].map(log_safe_merchant)
+        pii_safe_passion_debits.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, final_path)
+
+    if passion_summary:
+        wrote_any = True
+        tmp_path = os.path.join(crash_dump_dir, f"{run_id}_passion_summary.json.tmp")
+        final_path = os.path.join(crash_dump_dir, f"{run_id}_passion_summary.json")
+
+        def _json_safe(obj):
+            import math
+            import pandas as _pd2
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+            try:
+                if _pd2.isna(obj):
+                    return None
+            except (TypeError, ValueError):
+                pass
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return str(obj)
+
+        with open(tmp_path, "w") as f:
+            json.dump(passion_summary, f, indent=2, default=_json_safe)
+        os.replace(tmp_path, final_path)
+
+    return wrote_any
+
+
+def _resolve_passion_crash_fields(result=None, locals_snapshot=None):
+    """
+    Resolve passion fields for crash dumps without relying on inline locals()
+    expressions in the exception handler.
+    """
+    snap = locals_snapshot or {}
+
+    if "passion_debits" in snap:
+        passion_debits = snap.get("passion_debits")
+    else:
+        passion_debits = getattr(result, "passion_debits", None) if result is not None else None
+
+    if "passion_insights" in snap:
+        passion_insights = snap.get("passion_insights") or ()
+    else:
+        passion_insights = getattr(result, "passion_insights", ()) if result is not None else ()
+
+    if "passion_signals" in snap:
+        passion_signals = snap.get("passion_signals") or ()
+    else:
+        passion_signals = getattr(result, "passion_signals", ()) if result is not None else ()
+
+    return passion_debits, passion_insights, passion_signals
+
+
+def _attach_passion_results(
+    result: "PipelineResult",
+    process_fn=None,
+    replace_fn=None,
+    fields_fn=None,
+    rng=None,
+    strict_attach: bool = False,
+) -> "PipelineResult":
+    """
+    Attempt to run the passion pipeline and attach results to PipelineResult.
+
+    P2-3: MemoryError and RecursionError always propagate.
+    TimeoutError cancels the entire Passion sidecar.
+    Core PipelineResult is returned unchanged on any other failure.
+    strict_attach=True (set via env INSIGHT_ENGINE_PASSION_STRICT_ATTACH=true in CI)
+    makes all exceptions propagate.
+
+    Args:
+        result: The existing PipelineResult from the core pipeline.
+        debits: The debits DataFrame to analyze (will be deep-copied internally).
+        strict_attach: If True, all non-fatal exceptions propagate. Default False.
+
+    Returns:
+        A new PipelineResult with passion fields populated, or the original
+        result unchanged if the passion engine fails or is disabled.
+    """
+    def _with_passion_status(res: "PipelineResult", status: str) -> "PipelineResult":
+        import dataclasses as _dc
+        r_fn = replace_fn or _dc.replace
+        current_stats = getattr(res, "stats", {})
+        if not isinstance(current_stats, dict):
+            current_stats = {}
+        new_stats = {**current_stats, "passion_status": status}
+        return r_fn(res, stats=new_stats)
+
+    # FIX-33: Runtime kill switch — check on every call so env var changes
+    # take effect without restart. Default is now false!
+    import os as _os
+    enabled = _os.environ.get(
+        "INSIGHT_ENGINE_PASSION_ENABLED", "false"
+    ).lower() == "true"
+
+    if not enabled:
+        passion_logger.info("passion_engine_config", extra={"enabled": "false", "reason": "INSIGHT_ENGINE_PASSION_ENABLED=false"})
+        return _with_passion_status(result, "disabled")
+
+    if not strict_attach:
+        strict_attach = _os.environ.get(
+            "INSIGHT_ENGINE_PASSION_STRICT_ATTACH", "false"
+        ).lower() == "true"
+
+    try:
+        import dataclasses as _dc
+        import random
+        import pandas as pd
+        from schema import Col
+
+        if process_fn is None:
+            from passion_pipeline import process_pipeline as process_fn
+
+        replace_fn = replace_fn or _dc.replace
+        fields_fn = fields_fn or _dc.fields
+        rng = rng or random.Random(0)
+
+        # FIX 15: Extract debits from result to make contract robust to misuse
+        debits = result.debits if hasattr(result, "debits") else pd.DataFrame()
+
+        # P2-3: Preflight checks before calling process_fn
+        if not isinstance(debits, pd.DataFrame):
+            passion_logger.warning("passion_skip", extra={"reason": "non_dataframe"})
+            return _with_passion_status(result, "skipped")
+        # FIX-21: Configurable max rows limit to prevent memory blowup (default 100,000 rows)
+        max_rows = int(_os.environ.get("INSIGHT_ENGINE_PASSION_MAX_ROWS", "100000"))
+        if len(debits) > max_rows:
+            passion_logger.warning("passion_skip", extra={"reason": "exceeds_max_rows", "row_count": len(debits), "max_rows": max_rows})
+            _std_logger.warning("passion_skip exceeds_max_rows", extra={"row_count": len(debits), "max_rows": max_rows})
+            return _with_passion_status(result, "skipped")
+        if debits.empty:
+            passion_logger.info("passion_skip", extra={"reason": "empty_debits"})
+            return _with_passion_status(result, "skipped")
+        if debits.index.duplicated().any():
+            passion_logger.warning("passion_skip", extra={"reason": "duplicate_index"})
+            return _with_passion_status(result, "skipped")
+        # FIX 8: IS_KNOWN_PERSON is required
+        required = {Col.DATE, Col.AMOUNT, Col.PREDICTED_CATEGORY, Col.CLEANED_REMARKS, Col.IS_KNOWN_PERSON}
+        missing = required - set(debits.columns)
+        if missing:
+            passion_logger.warning("passion_skip", extra={"reason": "missing_columns", "missing": sorted(missing)})
+            return _with_passion_status(result, "skipped")
+        if debits.columns.duplicated().any():
+            passion_logger.warning("passion_skip", extra={"reason": "duplicate_columns"})
+            return _with_passion_status(result, "skipped")
+
+        # FIX C3 / L3: Preflight check — verify PipelineResult has the passion fields and stats
+        required_fields = {
+            "passion_debits", "passion_insights", "passion_signals", "stats"
+        }
+        actual_fields = {f.name for f in fields_fn(result)}
+        if missing := required_fields - actual_fields:
+            passion_logger.warning("passion_fields_missing", extra={"missing_fields": list(missing)})
+            # Fix #4a: Return with passion_status="missing_fields" — not bare result.
+            # A bare return loses the status audit trail needed for kill-switch monitoring.
+            return _with_passion_status(result, "missing_fields")
+
+        # A2 / L2: pass result and rng
+        passion_result = process_fn(
+            df_raw=debits,
+            strict_mode=True,
+            rng=rng,
+        )
+
+        # Blocker 14: Improve structured logs with required metrics
+        passion_logger.info("passion_engine_success", extra={
+            "outcome": "success",
+            "row_count": len(debits),
+            "candidate_count": len(passion_result.candidates),
+            "insight_count": len(passion_result.insights),
+            "signal_count": len(passion_result.passion_signals),
+        })
+
+        # Fix #4b: Single replace_fn call — _with_passion_status already calls replace_fn
+        # internally, so wrapping its result in a second replace_fn is a double-replace.
+        # Merge stats directly and replace all passion fields in one atomic call.
+        new_stats = {**getattr(result, "stats", {}), "passion_status": "success"}
+        return replace_fn(
+            result,
+            stats=new_stats,
+            passion_debits=passion_result.debits,
+            passion_insights=tuple(passion_result.insights),
+            passion_signals=tuple(passion_result.passion_signals),
+        )
+
+    except MemoryError:
+        raise
+    except RecursionError:
+        raise
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        raise
+    except TimeoutError as e:
+        passion_logger.warning("passion_engine_timeout", extra={"error_type": "TimeoutError", "stage": "attach_results", "safe_message": "Hard timeout or budget exceeded"})
+        _std_logger.warning("passion_engine_timeout", extra={"stage": "attach_results"})
+        if strict_attach:
+            raise
+        return _with_passion_status(result, "timeout")
+    except Exception as e:
+        passion_logger.warning(
+            "passion_engine_failed",
+            extra={
+                "error_type": type(e).__name__,
+                "stage": "attach_results",
+                "row_count": len(debits) if 'debits' in locals() and isinstance(debits, pd.DataFrame) else 0,
+                "column_count": len(debits.columns) if 'debits' in locals() and isinstance(debits, pd.DataFrame) else 0,
+            },
+            exc_info=True,
+        )
+        _std_logger.error("passion_engine_failed", extra={"error_type": type(e).__name__})
+        if strict_attach:
+            raise
+        return _with_passion_status(result, "failure")
+
 
 def run_pipeline(
     raw_df: pd.DataFrame,
@@ -330,7 +739,7 @@ def run_pipeline(
         logger.info(f"  Pipeline complete. Generated {len(insights)} insights.", extra={"event_type": "pipeline_complete", "metrics": {"insights_count": len(insights)}})
         logger.info("=" * 60)
 
-        return PipelineResult(
+        result = PipelineResult(
             debits=debits,
             credits=credits,
             insights=insights,
@@ -349,68 +758,57 @@ def run_pipeline(
             personal_debits=debits.loc[personal_mask].copy(),
             personal_credits=credits.loc[credits[Col.IS_KNOWN_PERSON].fillna(False)].copy()
         )
+
+        # Phase 7: Passion Engine (optional — errors are swallowed)
+        result = _attach_passion_results(result)
+
+        import os as _os
+        if _os.environ.get("INSIGHT_ENGINE_CRASH_TEST", "false").lower() == "true":
+            raise ValueError("Simulated post-passion crash")
+
+        return result
     except Exception:
         logger.critical(
-            "An unhandled exception crashed the pipeline core execution.", 
-            extra={"event_type": "pipeline_crash", "stage": "pipeline_core"}, 
+            "An unhandled exception crashed the pipeline core execution.",
+            extra={"event_type": "pipeline_crash", "stage": "pipeline_core"},
             exc_info=True
         )
-        
+
         if config.ENABLE_CRASH_DUMPS:
             try:
-                os.makedirs(config.CRASH_DUMP_DIR, exist_ok=True)
-                
-                if debits is not None and not isinstance(debits, pd.DataFrame):
-                    logger.warning(
-                        "Unexpected type for debits: %s",
-                        type(debits).__name__,
-                        extra={"event_type": "data_corruption", "stage": "crash_handler"}
-                    )
-                safe_debits = debits.head(1000) if isinstance(debits, pd.DataFrame) else pd.DataFrame()
-                
-                if credits is not None and not isinstance(credits, pd.DataFrame):
-                    logger.warning(
-                        "Unexpected type for credits: %s",
-                        type(credits).__name__,
-                        extra={"event_type": "data_corruption", "stage": "crash_handler"}
-                    )
-                safe_credits = credits.head(1000) if isinstance(credits, pd.DataFrame) else pd.DataFrame()
-                
-                wrote_any = False
-                
-                # Atomicity Note: Guaranteed on POSIX systems; best-effort on Windows.
-                if not safe_debits.empty:
-                    wrote_any = True
-                    tmp_path = os.path.join(config.CRASH_DUMP_DIR, f"{run_id}_debits.csv.tmp")
-                    final_path = os.path.join(config.CRASH_DUMP_DIR, f"{run_id}_debits.csv")
-                    safe_debits.to_csv(tmp_path, index=False)
-                    os.replace(tmp_path, final_path)
-                    
-                if not safe_credits.empty:
-                    wrote_any = True
-                    tmp_path = os.path.join(config.CRASH_DUMP_DIR, f"{run_id}_credits.csv.tmp")
-                    final_path = os.path.join(config.CRASH_DUMP_DIR, f"{run_id}_credits.csv")
-                    safe_credits.to_csv(tmp_path, index=False)
-                    os.replace(tmp_path, final_path)
-                    
-                if wrote_any:
+                _snapshot = dict(locals())
+                _passion_debits, _passion_insights, _passion_signals = _resolve_passion_crash_fields(
+                    result=_snapshot.get("result"),
+                    locals_snapshot=_snapshot,
+                )
+
+                _wrote_any = _write_crash_dumps(
+                    debits=_snapshot.get("debits"),
+                    credits=_snapshot.get("credits"),
+                    crash_dump_dir=config.CRASH_DUMP_DIR,
+                    passion_debits=_passion_debits,
+                    passion_insights=_passion_insights,
+                    passion_signals=_passion_signals,
+                    run_id=_snapshot.get("run_id"),
+                )
+
+                if _wrote_any:
                     logger.info(
-                        "Crash state snapshots written.", 
+                        "Crash state snapshots written.",
                         extra={"event_type": "crash_dump_success", "stage": "crash_handler"}
                     )
                 else:
                     logger.info(
-                        "No crash data available to persist.", 
+                        "No crash data available to persist.",
                         extra={"event_type": "crash_dump_empty", "stage": "crash_handler"}
                     )
-                
             except Exception:
                 logger.warning(
-                    "Failed to write state dump to CSV during crash handling sequence.", 
-                    extra={"event_type": "crash_dump_failed", "stage": "crash_handler"}, 
+                    "Failed to write state dump to CSV during crash handling sequence.",
+                    extra={"event_type": "crash_dump_failed", "stage": "crash_handler"},
                     exc_info=True
                 )
-    
+
         raise
     finally:
         pipeline_run_id_ctx.reset(token)
@@ -518,7 +916,7 @@ def run_inference(
         if spend_mask.any():
             insights = generate_human_insights(debits.loc[spend_mask])
 
-        return PipelineResult(
+        result = PipelineResult(
             debits=debits,
             credits=credits,
             insights=insights,
@@ -532,6 +930,10 @@ def run_inference(
             personal_debits=debits.loc[spend_mask == False].copy(),
             personal_credits=credits.loc[credits[Col.IS_KNOWN_PERSON].fillna(False)].copy()
         )
+
+        # Phase 7: Passion Engine (optional — errors are swallowed)
+        result = _attach_passion_results(result)
+        return result
     except Exception:
         logger.critical(
             "Inference crashed (no crash dump available).", 

@@ -25,9 +25,9 @@ from sklearn.model_selection import train_test_split
 from config import (
     CATEGORY_PRIORITY,
     INSIGHT_TYPES,
-    TIP_CORPUS,
     lookup_matching_tip_ids,
 )
+from contracts import TIP_CORPUS
 
 logger = logging.getLogger(__name__)
 
