@@ -42,6 +42,8 @@ class Candidate:
     suppression_reason: str = ""
     normalized_score: float = 0.0
     original_index: int = 0
+    # Step 5b: subcategory label from PassionSignal — empty string if not resolved.
+    subcategory: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'score', _coerce_finite_float(self.score, 'score'))
@@ -129,6 +131,7 @@ class Candidate:
             suppression_reason=signal.suppression_reason,
             normalized_score=normalized_score,
             original_index=original_index,
+            subcategory=getattr(signal, "subcategory", ""),  # Step 5b
         )
 
     @classmethod

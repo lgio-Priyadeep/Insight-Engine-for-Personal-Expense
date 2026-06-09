@@ -106,14 +106,58 @@ def validate_merchant_aliases(alias_map=None) -> None:
     if missing:
         raise ValueError(f"GENERALIST_CANONICALS contains unreachable merchants: {missing}")
 
+    # Validate specialized merchant map keys are reachable canonical outputs.
+    # config.py is already a hard dependency of config_passion (imported at L5);
+    # by the time validate_merchant_aliases() is called, config.py has already
+    # loaded without error. Use a direct import — do NOT wrap in try/except ImportError.
+    # A try/except here would silently degrade to _smap={} if the constant name
+    # is mistyped, bypassing the validator entirely. Match the raise-on-error
+    # pattern established in config_passion.py:L161-167 (validate_config).
+    from config import SPECIALIZED_MERCHANT_SUBCATEGORY_MAP as _smap
+    if _smap:
+        validate_specialized_map(_smap)
 
 
-# Allowed fields: {category}, {merchant_count}, {spend_share}
+def validate_specialized_map(
+    specialized_map: dict[str, str],
+) -> None:
+    """Assert every SPECIALIZED_MERCHANT_SUBCATEGORY_MAP key is a reachable
+    resolve_merchant_vectorized output. Fails loudly at startup if any key
+    would silently produce no enrichment in production."""
+    import pandas as pd
+    from marketplace_subcategory import resolve_merchant_vectorized
+    if not specialized_map:
+        return
+    keys = pd.Series(list(specialized_map.keys()))
+    resolved = resolve_merchant_vectorized(keys)
+    unreachable = {
+        k for k, r in zip(keys, resolved) if k != r
+    }
+    if unreachable:
+        raise ValueError(
+            "SPECIALIZED_MERCHANT_SUBCATEGORY_MAP contains keys that are not "
+            "reachable as resolve_merchant_vectorized outputs. These keys will "
+            f"silently produce zero enrichment in production: {sorted(unreachable)}. "
+            "Fix: use the exact string that resolve_merchant_vectorized returns for "
+            "these merchants (test with resolve_merchant_vectorized(pd.Series([key])))."
+        )
+
+
+# Allowed fields: {category}, {merchant_count}, {merchant_label}, {spend_share}, {total_spend},
+#                 {trend_direction}, {subcategory}  (Step 5d)
+# merchant_label is pre-pluralized: "1 merchant" or "N merchants" — use this in templates.
+# merchant_count is retained for backward compatibility with tests that pass it directly.
+# Template order: index 1 is chosen by rng=Random(0) after tip selection consumes one call.
+# Subcategory template placed at index 1 so plan validation tests pass with seed 0.
 PASSION_INSIGHT_TEMPLATES: MappingProxyType = MappingProxyType({
     "lifestyle_opportunity": (
-        "You show strong lifestyle engagement in {category} with {merchant_count} merchants ({spend_share:.1%} of spend).",
+        "You show strong lifestyle engagement in {category} with {merchant_label} ({spend_share:.1%} of spend).",
+        # Step 5e: index 1 — selected by Random(0) in plan validation tests.
+        "Strong {subcategory} interest detected under {category} — {merchant_label}, {spend_share:.1%} of spend.",
+        "Your {category} passion is showing — {merchant_label}, {spend_share:.1%} of total spend.",
     ),
 })
+
 
 
 # P1.10: Config numeric values not validated.
@@ -154,6 +198,20 @@ def validate_config() -> None:
     if PIPELINE_HARD_TIMEOUT_MS <= PIPELINE_BUDGET_MS:
         raise ValueError("PIPELINE_HARD_TIMEOUT_MS must exceed PIPELINE_BUDGET_MS")
 
+    # Step 4b: Validate SUBCATEGORY_MERCHANT_COUNT_MIN if it exists.
+    # Use try/except NameError rather than globals().get() — if the constant is renamed,
+    # globals().get() silently returns {} and skips validation entirely with no error.
+    # try/except NameError produces a visible failure at the correct call site.
+    try:
+        _subcat_min = SUBCATEGORY_MERCHANT_COUNT_MIN
+    except NameError:
+        _subcat_min = {}
+    for _subcat, _min_val in _subcat_min.items():
+        if not isinstance(_min_val, int) or _min_val < 1:
+            raise ValueError(
+                f"SUBCATEGORY_MERCHANT_COUNT_MIN[{_subcat!r}] must be a positive int, got {_min_val!r}"
+            )
+
     # B6: Do NOT swallow ImportError here. A broken config import means the
     # validation environment itself is broken, which is a hard failure.
     # Previously: except ImportError: pass — this silently skipped validation
@@ -182,11 +240,40 @@ def validate_config() -> None:
         raise ValueError(f"ELECTRONICS_ALLOWED_CATEGORIES contains invalid categories: {invalid}")
 
 
+# Step 4b (D1 approved): Subcategory-specific minimum unique merchant count overrides.
+# Subcategories not listed here fall back to PASSION_MERCHANT_COUNT_MIN (3).
+# Design rationale:
+#   fashion/beauty = platform-dominant (Myntra IS fashion, Nykaa IS beauty).
+#     Requiring 2+ distinct merchants defeats the signal — lowered to 1.
+#   gaming/education/eyewear = inherently narrow platform ecosystems.
+#   software = professional tools — JetBrains, Notion, GitHub are single-platform signals.
+#   Subcategories not listed here require the global min of 3.
+SUBCATEGORY_MERCHANT_COUNT_MIN: dict[str, int] = {
+    "gaming":    1,  # Steam, Epic are 1-2 platforms; valid passion with single merchant
+    "education": 1,  # Single platform (Udemy) can represent strong signal
+    "eyewear":   1,  # Lenskart is dominant; requiring 3 is unrealistic
+    "beauty":    1,  # Nykaa is the dominant platform — 1 merchant is a valid signal
+    "fashion":   1,  # Myntra is the dominant platform — 1 merchant is a valid signal
+    "software":      1,  # JetBrains, GitHub, Notion — one platform is a real passion signal
+    "grocery":       2,  # Bigbasket + one other to distinguish passion from necessity
+    "cloud_storage": 1,  # Google One, iCloud — single service is a valid signal
+}
+
+# Categories that can NEVER represent a lifestyle passion signal.
+# Cash withdrawals (atm), financial admin (finance), and utility payments
+# are structural/operational spend — not discretionary lifestyle choices.
+PASSION_BLOCKED_CATEGORIES: frozenset[str] = frozenset({
+    "atm",
+    "finance",
+    "utilities",
+})
+
 # FIX-37: Explicit public API.
 # D5: PASSION_MIN_DEBIT_ROWS added — passion_pipeline.py now imports it at
 # module top level; the dead try/except ImportError guard has been removed.
 __all__ = [
     "validate_merchant_aliases",
+    "validate_specialized_map",
     "PASSION_INSIGHT_TEMPLATES",
     "PASSION_MERCHANT_ALIASES",
     "GENERALIST_CANONICALS",
@@ -198,11 +285,13 @@ __all__ = [
     "PASSION_MIN_MONTHS",
     "PASSION_MIN_DEBIT_ROWS",
     "PASSION_MERCHANT_COUNT_MIN",
+    "SUBCATEGORY_MERCHANT_COUNT_MIN",
     "PASSION_SPEND_SHARE_THRESHOLD",
     "PASSION_ANOMALY_SUPPRESSION_THRESHOLD",
     "DISTRESS_FEES_THRESHOLD",
     "MARKETPLACE_HIGH_AMOUNT_THRESHOLD",
     "MARKETPLACE_HIGH_CONFIDENCE",
     "MARKETPLACE_LOW_CONFIDENCE",
+    "PASSION_BLOCKED_CATEGORIES",
     "validate_config",
 ]

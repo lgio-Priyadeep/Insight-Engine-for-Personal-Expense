@@ -129,7 +129,12 @@ def _validate_passion_templates() -> None:
         raise TypeError(f"PASSION_INSIGHT_TEMPLATES must be MappingProxyType, got {type(PASSION_INSIGHT_TEMPLATES)}")
     if "lifestyle_opportunity" not in PASSION_INSIGHT_TEMPLATES:
         raise ValueError("PASSION_INSIGHT_TEMPLATES must contain key 'lifestyle_opportunity'")
-    passion_allowed_fields = {"category", "merchant_count", "spend_share", "trend_direction", "total_spend"}
+    # Step 5a: "subcategory" added — passion templates may now reference {subcategory}.
+    # merchant_label: pre-pluralized version of merchant_count (e.g. "1 merchant" vs "3 merchants").
+    passion_allowed_fields = {
+        "category", "merchant_count", "merchant_label", "spend_share",
+        "trend_direction", "total_spend", "subcategory",
+    }
     for key, templates in PASSION_INSIGHT_TEMPLATES.items():
         if not isinstance(templates, tuple):
             raise TypeError(f"PASSION_INSIGHT_TEMPLATES['{key}'] must be tuple, got {type(templates)}")
@@ -176,9 +181,11 @@ def _dry_render_templates() -> None:
     # Blocker 17: Add total_spend and trend_direction to dry-render sample values
     _SAMPLE_VALUES = {
         "merchant": "sample_merchant", "amount": 1.0, "category": "food",
-        "merchant_count": 1, "spend_share": 0.1, "date": "2025-01-01",
+        "merchant_count": 1, "merchant_label": "1 merchant",  # pre-pluralized
+        "spend_share": 0.1, "date": "2025-01-01",
         "pct": 10, "frequency": "monthly",
         "total_spend": 100.0, "trend_direction": "non_declining",
+        "subcategory": "electronics",  # Step 5a
     }
     from config_passion import PASSION_INSIGHT_TEMPLATES
     all_corpora = [
@@ -221,6 +228,7 @@ def _dry_render_templates() -> None:
         "spend_share": 0.1,
         "trend_direction": "non_declining",
         "total_spend": 100.0,
+        "subcategory": "electronics",  # Step 5a
     }
     for tip_id, tip_data in TIP_CORPUS.items():
         t = tip_data.get("text", "")

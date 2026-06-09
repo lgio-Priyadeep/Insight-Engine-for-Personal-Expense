@@ -19,21 +19,33 @@ logger = get_logger(__name__)
 # FIX-9: RNG seed 0 is intentional. Output must be deterministic per input.
 # Template rotation is not part of this phase.
 
-def _select_tip(category: str, insight_type: str, rng: _random_module.Random) -> str:
-    # K3: Render tips using lookup_matching_tip_ids
-    # FIX-4: Catch ValueError symmetrically and log tip_lookup_failed with details.
-    try:
-        tip_ids = lookup_matching_tip_ids(category, insight_type)
-    except (KeyError, TypeError, IndexError, ValueError) as e:
-        logger.warning(
-            "tip_lookup_failed",
-            extra={
-                "category": category,
-                "insight_type": insight_type,
-                "error_type": type(e).__name__,
-            },
-        )
-        return ""
+def _select_tip(category: str, insight_type: str, rng: _random_module.Random,
+                subcategory: str = "") -> str:
+    # K3: Render tips using lookup_matching_tip_ids.
+    # Step 5: When subcategory has its own passion tips, prefer them over parent category tips.
+    # This handles cases where category="shopping" but subcategory="education" (e.g. Coursera).
+    tip_ids: list[str] = []
+    if subcategory:
+        try:
+            subcat_tip_ids = lookup_matching_tip_ids(subcategory, insight_type)
+            if subcat_tip_ids:
+                tip_ids = subcat_tip_ids
+        except (KeyError, TypeError, IndexError, ValueError):
+            pass  # Fall through to category tips
+
+    if not tip_ids:
+        try:
+            tip_ids = lookup_matching_tip_ids(category, insight_type)
+        except (KeyError, TypeError, IndexError, ValueError) as e:
+            logger.warning(
+                "tip_lookup_failed",
+                extra={
+                    "category": category,
+                    "insight_type": insight_type,
+                    "error_type": type(e).__name__,
+                },
+            )
+            return ""
     if not tip_ids:
         return ""
     tip_id = rng.choice(tip_ids)
@@ -41,18 +53,30 @@ def _select_tip(category: str, insight_type: str, rng: _random_module.Random) ->
     return tip_data.get("text", "")
 
 
+
 def _render_candidate(candidate, rng: _random_module.Random) -> tuple[str, str]:
     # K2: Render Candidate.passion through PASSION_INSIGHT_TEMPLATES["lifestyle_opportunity"]
     if candidate.insight_type == "lifestyle_opportunity":
+        merchant_count = getattr(candidate, "merchant_count", 1)
         values = {
             "category": candidate.category,
-            "merchant_count": getattr(candidate, "merchant_count", 1),
+            "merchant_count": merchant_count,
+            # Pre-pluralized: "1 merchant" not "1 merchants".
+            "merchant_label": f"{merchant_count} merchant" if merchant_count == 1 else f"{merchant_count} merchants",
             "spend_share": getattr(candidate, "spend_share", 0.0),
             "total_spend": getattr(candidate, "total_spend", 0.0),
             "trend_direction": getattr(candidate, "trend_direction", ""),
+            "subcategory": getattr(candidate, "subcategory", ""),  # Step 5c
         }
         templates = PASSION_INSIGHT_TEMPLATES.get("lifestyle_opportunity", ())
+        # Step 5e: When subcategory is not resolved, exclude templates that reference
+        # {subcategory} to avoid blank renders like "Strong  interest detected under...".
+        # Filter is purely cosmetic — RNG sequence is not consumed by filtered templates.
+        subcategory_val = getattr(candidate, "subcategory", "")
+        if not subcategory_val:
+            templates = tuple(t for t in templates if "{subcategory}" not in t) or templates
         fallback_insight = f"High engagement observed in {candidate.category}."
+
     else:
         values = {
             "merchant": candidate.merchant,
@@ -66,7 +90,10 @@ def _render_candidate(candidate, rng: _random_module.Random) -> tuple[str, str]:
 
     validate_template_values(values)
     try:
-        tip_template = _select_tip(candidate.category, candidate.insight_type, rng)
+        tip_template = _select_tip(
+            candidate.category, candidate.insight_type, rng,
+            subcategory=getattr(candidate, "subcategory", ""),
+        )
         tip = tip_template.format(**values) if tip_template else ""
     except (KeyError, ValueError, TypeError, IndexError) as e:
         logger.warning(

@@ -722,9 +722,15 @@ class TestDetectPassions:
 
 class TestSuppressedSignals:
   def _make_df(self):
+      # Step 4a compatibility: all merchants must be generalist (GENERALIST_CANONICALS)
+      # so they all resolve to "general_purchase" subcategory after enrich_subcategories.
+      # This keeps all rows in one ("shopping", "general_purchase") group with 3 unique
+      # merchants (amazon, flipkart, meesho), satisfying effective_min=3 (global gate).
+      # Previously used "myntra" which after Step 4a splits into ("shopping", "fashion")
+      # with only 1 merchant — failing effective_min=2 and producing zero signals.
       return pd.DataFrame({
           "amount": [500.0, 600.0, 550.0, 700.0],
-          "cleaned_remarks": ["amazon", "flipkart", "myntra", "amazon"],
+          "cleaned_remarks": ["amazon", "flipkart", "meesho", "amazon"],
           "date": ["2023-01-01", "2023-02-01", "2023-03-01", "2023-04-01"],
           "predicted_category": ["shopping", "shopping", "shopping", "shopping"],
           "is_known_person": [False, False, False, False],
@@ -2454,3 +2460,511 @@ class TestConfigPassionCanonicals:
           f"Required for GENERALIST_CANONICALS: {GENERALIST_CANONICALS}"
       )
 # END_CB_P8_01
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-EXECUTION VALIDATION SUITE — Passion Detector Subcategory Mitigation
+# Steps 1–5e + E2E. Run with: python -m pytest -k "Subcategory or Specialized or
+# Education or InsightSurface" -x -q
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Step 1: SPECIALIZED_MERCHANT_SUBCATEGORY_MAP + validate_specialized_map ───
+
+class TestSpecializedMerchantMap:
+  def test_map_importable_and_nonempty(self):
+      from config import SPECIALIZED_MERCHANT_SUBCATEGORY_MAP
+      assert isinstance(SPECIALIZED_MERCHANT_SUBCATEGORY_MAP, dict)
+      assert len(SPECIALIZED_MERCHANT_SUBCATEGORY_MAP) > 0
+
+  def test_all_keys_lowercase_strings(self):
+      from config import SPECIALIZED_MERCHANT_SUBCATEGORY_MAP
+      for k, v in SPECIALIZED_MERCHANT_SUBCATEGORY_MAP.items():
+          assert isinstance(k, str) and k == k.lower(), f"Key not lowercase: {k!r}"
+          assert isinstance(v, str) and v == v.lower(), f"Value not lowercase: {v!r}"
+
+  def test_all_keys_self_resolve(self):
+      from config import SPECIALIZED_MERCHANT_SUBCATEGORY_MAP
+      from marketplace_subcategory import resolve_merchant_vectorized
+      keys = pd.Series(list(SPECIALIZED_MERCHANT_SUBCATEGORY_MAP.keys()))
+      resolved = resolve_merchant_vectorized(keys)
+      unreachable = {k for k, r in zip(keys, resolved) if k != r}
+      assert not unreachable, (
+          f"Keys not reachable as resolver outputs (will produce zero enrichment): {unreachable}"
+      )
+
+  def test_validate_specialized_map_raises_on_bad_key(self):
+      from config_passion import validate_specialized_map
+      bad_map = {"MYNTRA": "fashion"}
+      with pytest.raises(ValueError, match="not reachable"):
+          validate_specialized_map(bad_map)
+
+  def test_validate_specialized_map_passes_for_known_good_keys(self):
+      from config_passion import validate_specialized_map
+      good_map = {
+          "myntra": "fashion", "nykaa": "beauty", "decathlon": "fitness",
+          "lenskart": "eyewear", "udemy": "education", "winzo": "gaming",
+      }
+      validate_specialized_map(good_map)
+
+  def test_validate_specialized_map_noop_on_empty(self):
+      from config_passion import validate_specialized_map
+      validate_specialized_map({})
+
+
+# ── Step 2: enrich_subcategories specialized merchant path ────────────────────
+
+class TestSubcategoryEnrichmentSpecializedPath:
+  def _base_df(self, remarks, amounts=None, category="shopping"):
+      n = len(remarks)
+      return pd.DataFrame({
+          "amount": amounts if amounts else [500.0] * n,
+          "cleaned_remarks": remarks,
+          "predicted_category": [category] * n,
+          "is_known_person": [False] * n,
+      })
+
+  def test_specialized_enrichment_fires_without_generalists(self):
+      df = self._base_df(["myntra", "nykaa", "decathlon"])
+      result = enrich_subcategories(df)
+      subcats = result["inferred_subcategory"].tolist()
+      assert "fashion" in subcats, "Myntra must produce 'fashion' subcategory"
+      assert "beauty" in subcats, "Nykaa must produce 'beauty' subcategory"
+      assert "fitness" in subcats, "Decathlon must produce 'fitness' subcategory"
+      assert not result["inferred_subcategory"].isna().any(), (
+          "pd.NA found — early-return guard bug is still present"
+      )
+
+  def test_generalist_path_unchanged(self):
+      df = self._base_df(["amazon"], amounts=[1500.0])
+      result = enrich_subcategories(df)
+      assert result["inferred_subcategory"].iloc[0] == "electronics"
+      assert result["subcategory_confidence"].iloc[0] == pytest.approx(0.90)
+
+  def test_generalist_takes_priority_over_specialized(self):
+      df = self._base_df(["amazon", "myntra"], amounts=[1500.0, 500.0])
+      result = enrich_subcategories(df)
+      assert result["inferred_subcategory"].iloc[0] == "electronics"
+      assert result["inferred_subcategory"].iloc[1] == "fashion"
+
+  def test_ineligible_known_person_row_stays_na(self):
+      df = pd.DataFrame({
+          "amount": [500.0, 500.0],
+          "cleaned_remarks": ["myntra", "myntra"],
+          "predicted_category": ["shopping", "shopping"],
+          "is_known_person": [False, True],
+      })
+      result = enrich_subcategories(df)
+      assert result["inferred_subcategory"].iloc[0] == "fashion"
+      assert pd.isna(result["inferred_subcategory"].iloc[1])
+      assert result["subcategory_confidence"].iloc[1] == 0.0
+
+  def test_unknown_merchant_stays_na(self):
+      df = self._base_df(["some_random_merchant_xyz"])
+      result = enrich_subcategories(df)
+      assert pd.isna(result["inferred_subcategory"].iloc[0])
+
+  def test_mixed_generalist_and_specialized_and_unknown(self):
+      df = self._base_df(
+          ["amazon", "myntra", "unknown_xyz"],
+          amounts=[1500.0, 500.0, 200.0],
+      )
+      result = enrich_subcategories(df)
+      assert result["inferred_subcategory"].iloc[0] == "electronics"
+      assert result["inferred_subcategory"].iloc[1] == "fashion"
+      assert pd.isna(result["inferred_subcategory"].iloc[2])
+
+
+# ── Step 3: PassionSignal subcategory field ───────────────────────────────────
+
+class TestPassionSignalSubcategoryField:
+  def _make_signal(self, **kwargs):
+      from passion_models import PassionSignal
+      defaults = dict(
+          category="shopping",
+          merchant_list=("myntra", "nykaa", "decathlon"),
+          total_spend=3000.0,
+          merchant_count=3,
+          spend_share=0.35,
+          trend_direction="non_declining",
+      )
+      return PassionSignal(**{**defaults, **kwargs})
+
+  def test_default_subcategory_is_empty_string(self):
+      sig = self._make_signal()
+      assert sig.subcategory == ""
+
+  def test_subcategory_accepted_and_normalized(self):
+      sig = self._make_signal(subcategory="Max Fashion")
+      assert sig.subcategory == "max_fashion"
+
+  def test_subcategory_plain_lowercase(self):
+      sig = self._make_signal(subcategory="fashion")
+      assert sig.subcategory == "fashion"
+
+  def test_subcategory_strips_whitespace(self):
+      sig = self._make_signal(subcategory="  beauty  ")
+      assert sig.subcategory == "beauty"
+
+  def test_subcategory_non_string_raises_type_error(self):
+      from passion_models import PassionSignal
+      with pytest.raises(TypeError, match="subcategory must be str"):
+          self._make_signal(subcategory=123)
+
+  def test_subcategory_frozen_field_is_immutable(self):
+      sig = self._make_signal(subcategory="fashion")
+      with pytest.raises((AttributeError, TypeError)):
+          sig.subcategory = "other"
+
+
+# ── Step 4a: detect_passions groupby + subcategory propagation ────────────────
+
+class TestDetectPassionsSubcategoryGroupby:
+  def _make_df(self, remarks, subcats=None, amounts=None, dates=None):
+      n = len(remarks)
+      return pd.DataFrame({
+          "amount": amounts or [500.0] * n,
+          "cleaned_remarks": remarks,
+          "predicted_category": ["shopping"] * n,
+          "inferred_subcategory": subcats or [""] * n,
+          "date": dates or [
+              f"2023-0{i+1}-01" for i in range(min(n, 9))
+          ] + [f"2023-10-{i+1:02d}" for i in range(max(0, n - 9))],
+          "is_known_person": [False] * n,
+      })
+
+  def test_missing_subcategory_column_does_not_crash(self):
+      df = pd.DataFrame({
+          "amount": [500.0, 500.0, 500.0],
+          "cleaned_remarks": ["amazon", "flipkart", "myntra"],
+          "predicted_category": ["shopping"] * 3,
+          "date": ["2023-01-01", "2023-02-01", "2023-03-01"],
+      })
+      spend_mask = pd.Series([True, True, True], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False):
+          signals = detect_passions(df, spend_mask)
+      assert isinstance(signals, list)
+
+  def test_subcategory_propagated_to_passion_signal(self):
+      # 3 rows of myntra (same merchant) with subcategory='fashion'.
+      # Patches _SUBCATEGORY_MIN with fashion=1 to allow single specialized merchant through.
+      # This test validates subcategory propagation, not threshold config.
+      df = self._make_df(
+          remarks=["myntra", "myntra", "myntra"],
+          subcats=["fashion", "fashion", "fashion"],
+          amounts=[600.0, 700.0, 800.0],
+          dates=["2023-01-01", "2023-02-01", "2023-03-01"],
+      )
+      spend_mask = pd.Series([True, True, True], index=df.index)
+      resolved = pd.Series(["myntra", "myntra", "myntra"], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False), \
+           patch("passion_detector._SUBCATEGORY_MIN", {"fashion": 1}, create=True):
+          signals = detect_passions(df, spend_mask, resolved)
+      assert len(signals) >= 1
+      assert signals[0].subcategory == "fashion"
+
+
+  def test_pd_na_subcategory_normalizes_to_empty_string(self):
+      df = self._make_df(
+          remarks=["amazon", "flipkart", "myntra"],
+          amounts=[500.0, 600.0, 700.0],
+          dates=["2023-01-01", "2023-02-01", "2023-03-01"],
+      )
+      df["inferred_subcategory"] = pd.NA
+      spend_mask = pd.Series([True, True, True], index=df.index)
+      resolved = pd.Series(["amazon", "flipkart", "myntra"], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False):
+          signals = detect_passions(df, spend_mask, resolved)
+      for sig in signals:
+          assert sig.subcategory != "<na>", (
+              "pd.NA group key leaked as '<na>' string into PassionSignal.subcategory"
+          )
+          assert sig.subcategory != "nan", (
+              "'nan' string leaked into PassionSignal.subcategory"
+          )
+
+  def test_non_enriched_rows_produce_signal_with_empty_subcategory(self):
+      df = self._make_df(
+          remarks=["amazon", "flipkart", "myntra"],
+          subcats=["", "", ""],
+          amounts=[500.0, 600.0, 700.0],
+          dates=["2023-01-01", "2023-02-01", "2023-03-01"],
+      )
+      spend_mask = pd.Series([True, True, True], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False):
+          signals = detect_passions(df, spend_mask)
+      assert len(signals) >= 1
+      assert signals[0].subcategory == ""
+
+
+# ── Step 4b: SUBCATEGORY_MERCHANT_COUNT_MIN gate ─────────────────────────────
+
+class TestSubcategoryMerchantCountGate:
+  def test_gaming_single_merchant_passes_with_override(self):
+      import config_passion as _cp
+      if not hasattr(_cp, "SUBCATEGORY_MERCHANT_COUNT_MIN"):
+          pytest.skip("Step 4b not yet applied — SUBCATEGORY_MERCHANT_COUNT_MIN missing")
+      df = pd.DataFrame({
+          "amount": [500.0, 600.0, 700.0],
+          "cleaned_remarks": ["winzo", "winzo", "winzo"],
+          "predicted_category": ["gaming"] * 3,
+          "inferred_subcategory": ["gaming"] * 3,
+          "date": ["2023-01-01", "2023-02-01", "2023-03-01"],
+      })
+      spend_mask = pd.Series([True, True, True], index=df.index)
+      resolved = pd.Series(["winzo", "winzo", "winzo"], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False), \
+           patch("passion_detector._SUBCATEGORY_MIN", {"gaming": 1}, create=True):
+          signals = detect_passions(df, spend_mask, resolved)
+      assert len(signals) >= 1, (
+          "Single gaming merchant must pass with SUBCATEGORY_MERCHANT_COUNT_MIN['gaming']=1"
+      )
+
+  def test_unknown_subcategory_falls_back_to_global_gate(self):
+      import config_passion as _cp
+      if not hasattr(_cp, "SUBCATEGORY_MERCHANT_COUNT_MIN"):
+          pytest.skip("Step 4b not yet applied — SUBCATEGORY_MERCHANT_COUNT_MIN missing")
+      df = pd.DataFrame({
+          "amount": [500.0, 500.0],
+          "cleaned_remarks": ["pepperfry", "pepperfry"],
+          "predicted_category": ["shopping"] * 2,
+          "inferred_subcategory": ["home_kitchen"] * 2,
+          "date": ["2023-01-01", "2023-02-01"],
+      })
+      spend_mask = pd.Series([True, True], index=df.index)
+      with patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False), \
+           patch("passion_detector._SUBCATEGORY_MIN", {}, create=True):
+          signals = detect_passions(df, spend_mask)
+      assert len(signals) == 0, (
+          "home_kitchen with 1 unique merchant must fail global gate when no override set"
+      )
+
+  def test_validate_config_rejects_negative_subcategory_min(self):
+      import config_passion as _cp
+      if not hasattr(_cp, "SUBCATEGORY_MERCHANT_COUNT_MIN"):
+          pytest.skip("Step 4b not yet applied — SUBCATEGORY_MERCHANT_COUNT_MIN missing")
+      from config_passion import validate_config
+      with patch("config_passion.SUBCATEGORY_MERCHANT_COUNT_MIN", {"gaming": -1}, create=True):
+          with pytest.raises(ValueError, match="SUBCATEGORY_MERCHANT_COUNT_MIN"):
+              validate_config()
+
+  def test_validate_config_rejects_non_int_subcategory_min(self):
+      import config_passion as _cp
+      if not hasattr(_cp, "SUBCATEGORY_MERCHANT_COUNT_MIN"):
+          pytest.skip("Step 4b not yet applied — SUBCATEGORY_MERCHANT_COUNT_MIN missing")
+      from config_passion import validate_config
+      with patch("config_passion.SUBCATEGORY_MERCHANT_COUNT_MIN", {"gaming": 1.5}, create=True):
+          with pytest.raises(ValueError, match="SUBCATEGORY_MERCHANT_COUNT_MIN"):
+              validate_config()
+
+
+# ── Step 4c: Education distress gate exemption ────────────────────────────────
+
+class TestEducationDistressGateExemption:
+  def test_tuition_fee_not_flagged_as_distress(self):
+      df = pd.DataFrame({
+          "cleaned_remarks": ["tuition fee", "course fee", "udemy subscription",
+                              "udemy subscription", "vedantu class"],
+          "amount": [5000.0, 2000.0, 999.0, 999.0, 799.0],
+      })
+      assert _check_distress_gate(df) is False
+
+  def test_plain_fee_without_education_context_still_triggers(self):
+      df = pd.DataFrame({
+          "cleaned_remarks": ["late payment fee", "penalty charge", "bounce charge",
+                              "interest overdue", "processing fee"],
+          "amount": [100.0] * 5,
+      })
+      assert _check_distress_gate(df) is True
+
+  def test_exemption_pattern_partial_match_still_gated(self):
+      legit_edu = ["exam fee", "admission fee"] + ["udemy subscription"] * 18
+      df = pd.DataFrame({
+          "cleaned_remarks": legit_edu,
+          "amount": [1000.0] * 20,
+      })
+      assert _check_distress_gate(df) is False
+
+  def test_plural_fees_also_exempted(self):
+      df = pd.DataFrame({
+          "cleaned_remarks": ["exam fees", "tuition fees", "course fees",
+                              "admission fees", "udemy subscription"],
+          "amount": [1000.0] * 5,
+      })
+      assert _check_distress_gate(df) is False
+
+  def test_plural_fees_without_education_context_still_triggers(self):
+      df = pd.DataFrame({
+          "cleaned_remarks": ["late fees", "processing fees", "penalty fees",
+                              "bounce fees", "overdue fees"],
+          "amount": [100.0] * 5,
+      })
+      assert _check_distress_gate(df) is True
+
+
+# ── Step 5: Candidate + insight generator + bootstrap ─────────────────────────
+
+class TestSubcategoryInsightSurface:
+  def _make_signal(self, subcategory="fashion"):
+      from passion_models import PassionSignal
+      return PassionSignal(
+          category="shopping",
+          merchant_list=("myntra", "nykaa", "decathlon"),
+          total_spend=3000.0,
+          merchant_count=3,
+          spend_share=0.35,
+          trend_direction="non_declining",
+          subcategory=subcategory,
+      )
+
+  def test_candidate_passion_carries_subcategory(self):
+      from candidate import Candidate
+      sig = self._make_signal(subcategory="fashion")
+      cand = Candidate.passion(
+          signal=sig,
+          sort_key_ts=1672531200,
+          normalized_score=0.35,
+          original_index=0,
+      )
+      assert cand.subcategory == "fashion"
+
+  def test_candidate_default_subcategory_is_empty(self):
+      from candidate import Candidate
+      sig = self._make_signal(subcategory="")
+      cand = Candidate.passion(
+          signal=sig,
+          sort_key_ts=1672531200,
+          normalized_score=0.35,
+          original_index=0,
+      )
+      assert cand.subcategory == ""
+
+  def test_subcategory_appears_in_insight_text(self):
+      from candidate import Candidate
+      sig = self._make_signal(subcategory="fashion")
+      cand = Candidate.passion(
+          signal=sig,
+          sort_key_ts=1672531200,
+          normalized_score=0.35,
+          original_index=0,
+      )
+      rng = random.Random(0)
+      insights = generate_passion_insights([cand], top_n=1, strict_mode=True, rng=rng)
+      assert len(insights) == 1
+      assert "fashion" in insights[0].lower(), (
+          f"Expected 'fashion' in insight text, got: {insights[0]!r}"
+      )
+
+  def test_empty_subcategory_falls_back_to_category_in_insight(self):
+      from candidate import Candidate
+      sig = self._make_signal(subcategory="")
+      cand = Candidate.passion(
+          signal=sig,
+          sort_key_ts=1672531200,
+          normalized_score=0.35,
+          original_index=0,
+      )
+      rng = random.Random(0)
+      insights = generate_passion_insights([cand], top_n=1, strict_mode=True, rng=rng)
+      assert len(insights) == 1
+      assert "shopping" in insights[0].lower(), (
+          f"Fallback category 'shopping' expected in insight, got: {insights[0]!r}"
+      )
+      assert insights[0].strip() != "", "Insight text must not be empty"
+      assert "  " not in insights[0], "Double space from empty subcategory in insight text"
+
+  def test_bootstrap_dry_render_passes_with_subcategory(self):
+      from bootstrap import _dry_render_templates
+      _dry_render_templates()
+
+  def test_bootstrap_startup_checks_pass(self):
+      from bootstrap import (
+          _validate_schema_columns,
+          _validate_insight_templates,
+          _validate_passion_templates,
+          _validate_tip_corpus,
+          _dry_render_templates,
+      )
+      from config_passion import validate_config, validate_merchant_aliases
+      validate_merchant_aliases()
+      _validate_schema_columns()
+      _validate_insight_templates()
+      _validate_passion_templates()
+      _validate_tip_corpus()
+      _dry_render_templates()
+      validate_config()
+
+  def test_validate_passion_templates_accepts_subcategory_field(self):
+      from bootstrap import _validate_passion_templates
+      _validate_passion_templates()
+
+
+# ── E2E: Full pipeline subcategory flow ───────────────────────────────────────
+
+class TestSubcategoryEndToEnd:
+  def _make_pipeline_df(self, remarks, subcats=None):
+      n = len(remarks)
+      return pd.DataFrame({
+          "amount": [800.0] * n,
+          "cleaned_remarks": remarks,
+          "predicted_category": ["shopping"] * n,
+          "date": [f"2023-0{i+1}-01" if i < 9 else "2023-10-01" for i in range(n)],
+          "is_known_person": [False] * n,
+      })
+
+  def test_pipeline_output_contains_subcategory_columns(self):
+      df = self._make_pipeline_df(["myntra", "nykaa", "decathlon"])
+      result = process_pipeline(df_raw=df, strict_mode=False)
+      assert "inferred_subcategory" in result.debits.columns
+      assert "subcategory_confidence" in result.debits.columns
+
+  def test_specialized_merchant_subcategory_reaches_passion_signal(self):
+      import config_passion as _cp
+      if not hasattr(_cp, "SUBCATEGORY_MERCHANT_COUNT_MIN"):
+          pytest.skip("Step 4b not yet applied — SUBCATEGORY_MERCHANT_COUNT_MIN missing")
+      df = self._make_pipeline_df(
+          remarks=["myntra", "myntra", "myntra",
+                   "nykaa",  "nykaa",  "nykaa",
+                   "decathlon", "decathlon", "decathlon"],
+      )
+      with patch("passion_detector._SUBCATEGORY_MIN",
+                 {"fashion": 1, "beauty": 1, "fitness": 1}, create=True), \
+           patch("passion_detector._check_distress_gate", return_value=False), \
+           patch("passion_detector._is_non_declining", return_value=True), \
+           patch("passion_detector._check_anomaly_suppression", return_value=False):
+          result = process_pipeline(df_raw=df, strict_mode=False)
+      subcats = {s.subcategory for s in result.passion_signals}
+      assert "fashion" in subcats or "beauty" in subcats or "fitness" in subcats, (
+          f"Expected at least one specialized subcategory in signals; got: {subcats}"
+      )
+
+  def test_pipeline_index_uniqueness_enforced(self):
+      df = self._make_pipeline_df(["amazon", "flipkart", "myntra"])
+      df.index = [0, 0, 1]
+      with pytest.raises(ValueError, match="duplicate index"):
+          process_pipeline(df_raw=df, strict_mode=True)
+
+  def test_pipeline_subcategory_not_in_non_specialized_rows(self):
+      df = pd.DataFrame({
+          "amount": [200.0, 200.0, 200.0],
+          "cleaned_remarks": ["zomato", "swiggy", "dominos"],
+          "predicted_category": ["food"] * 3,
+          "date": ["2023-01-01", "2023-02-01", "2023-03-01"],
+          "is_known_person": [False] * 3,
+      })
+      result = process_pipeline(df_raw=df, strict_mode=False)
+      assert result.debits["inferred_subcategory"].isna().all(), (
+          "Non-specialized merchants (food delivery) must not receive subcategory enrichment"
+      )
+

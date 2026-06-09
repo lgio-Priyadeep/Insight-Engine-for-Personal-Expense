@@ -220,6 +220,21 @@ SPECIFIC_MERCHANT_ALIASES: dict[str, str] = {
     r"whitehat\s?jr?|white\s?hat":         "WhiteHat Jr",
     r"great\s?learning":                    "Great Learning",
     r"simplilearn":                         "Simplilearn",
+    # Developer tools & professional software
+    r"github\b":                            "github",
+    r"gitlab\b":                            "gitlab",
+    r"jetbrains":                           "jetbrains",
+    r"o'?reilly|oreilly":                  "oreilly",
+    r"notion\.so|notion\b":               "notion",
+    r"figma\b":                             "figma",
+    r"canva\b":                             "canva",
+    r"adobe\s?(systems?|creative|cloud)?":"adobe systems",
+    r"sketch\b":                            "sketch",
+    # Cloud storage & productivity
+    r"google\s?one":                        "google one",
+    r"icloud\b|apple\s?icloud":           "icloud",
+    r"dropbox":                             "dropbox",
+    r"onedrive|one\s?drive":              "onedrive",
 
     # ── Gaming & Fantasy Sports ──────────────────────────────────────────────
     r"dream\s?11|dream11":                 "Dream11",
@@ -227,6 +242,17 @@ SPECIFIC_MERCHANT_ALIASES: dict[str, str] = {
     r"winzo":                               "Winzo",
     r"my11circle":                          "My11Circle",
     r"games?\s?24x7":                      "Games24x7",
+    # Global gaming platforms (common in UPI ecom/POS narrations)
+    r"steam\s?(games?|wallet|store)?":     "steam",
+    r"epic\s?games?":                      "epic games",
+    r"google\s?play":                      "google play",
+    r"playstation\s?(store|network|psn)?":"playstation",
+    r"xbox\s?(live|game\s?pass|store)?":  "xbox",
+    r"nintendo\s?(eshop|store|online)?":  "nintendo",
+    r"ea\s?(games?|play|sports)":         "ea games",
+    r"battlenet|battle\.net":             "battlenet",
+    r"gog\.com|good\s?old\s?games":      "gog",
+    r"humble\s?bundle":                   "humble bundle",
 
     # ── Real Estate ──────────────────────────────────────────────────────────
     r"nobroker":                            "NoBroker",
@@ -234,6 +260,113 @@ SPECIFIC_MERCHANT_ALIASES: dict[str, str] = {
     r"99acres|99\s?acres":                 "99acres",
     r"housing\s?\.?\s?com":               "Housing.com",
     r"commonfloor":                         "CommonFloor",
+}
+
+# ── Specialized Merchant → Subcategory Mapping ────────────────────────────────
+# Used by enrich_subcategories() for deterministic subcategory assignment.
+# Keys: EXACT lowercased canonical names (post-resolve_merchant_vectorized output).
+# Values: subcategory string (must be lowercase, no spaces).
+# These merchants are NOT generalist platforms — they carry strong categorical signal.
+# WARNING: Do NOT mix regex patterns here. Keys must be exact lowercase strings.
+SPECIALIZED_MERCHANT_SUBCATEGORY_MAP: dict[str, str] = {
+    # Fashion & Apparel
+    "myntra":        "fashion",
+    "ajio":          "fashion",
+    "zara":          "fashion",
+    "h&m":           "fashion",
+    "westside":      "fashion",
+    "pantaloons":    "fashion",
+    "fabindia":      "fashion",
+    "bewakoof":      "fashion",
+    "max fashion":   "fashion",
+
+    # Beauty & Personal Care
+    "nykaa":         "beauty",
+
+    # Fitness & Sports
+    "decathlon":     "fitness",
+
+    # Home & Furniture
+    "pepperfry":     "home_kitchen",
+    "ikea":          "home_kitchen",
+    "urban ladder":  "home_kitchen",
+
+    # Electronics & Tech
+    "croma":         "electronics",
+    "apple store":   "electronics",
+    "reliance digital": "electronics",
+    "vijay sales":   "electronics",
+
+    # Baby & Kids
+    "firstcry":      "baby",
+
+    # Grocery & Quick Commerce
+    "bigbasket":     "grocery",
+    "blinkit":       "grocery",
+    "zepto":         "grocery",
+    "dunzo":         "grocery",
+    "jiomart":       "grocery",
+
+    # Eyewear
+    "lenskart":      "eyewear",
+
+    # Education & Ed-Tech
+    "byju's":        "education",
+    "unacademy":     "education",
+    "vedantu":       "education",
+    "upgrad":        "education",
+    "coursera":      "education",
+    "udemy":         "education",
+    "great learning": "education",
+    "simplilearn":   "education",
+    "whitehat jr":   "education",
+    "skillshare":    "education",
+    "pluralsight":   "education",
+    "edx":           "education",
+
+    # Developer Tools & Professional Software
+    "github":        "software",
+    "gitlab":        "software",
+    "jetbrains":     "software",
+    "oreilly":       "education",
+    "notion":        "software",
+    "figma":         "software",
+    "canva":         "software",
+    "adobe":         "software",
+    "adobe systems": "software",
+    "sketch":        "software",
+
+    # Cloud Platforms
+    "aws training":      "education",
+    "google cloud":      "education",
+    "microsoft azure":   "education",
+
+    # Cloud Storage/Utilities
+    "google one":    "cloud_storage",
+    "icloud":        "cloud_storage",
+    "dropbox":       "cloud_storage",
+
+    # Gaming Platforms
+    "steam":         "gaming",
+    "epic games":    "gaming",
+    "epicgames":     "gaming",
+    "google play":   "gaming",
+    "playstation":   "gaming",
+    "xbox":          "gaming",
+    "nintendo":      "gaming",
+    "ea games":      "gaming",
+    "battlenet":     "gaming",
+    "gog":           "gaming",
+
+    # Gaming (India-specific fantasy/gaming platforms)
+    "dream11":       "gaming",
+    "mpl":           "gaming",
+    "winzo":         "gaming",
+    "my11circle":    "gaming",
+    "games24x7":     "gaming",
+
+    # Boat (electronics/audio — separate from apparel)
+    "boat":          "electronics",
 }
 
 
@@ -247,6 +380,7 @@ HIGH_PRIORITY = [
 ]
 
 MEDIUM_PRIORITY = [
+    "education",    # ed-tech, courses, tools — above food to override fallback
     "food",         # zomato, swiggy, restaurants
     "transport",    # uber, ola, fuel
     "shopping",     # amazon, flipkart, retail
@@ -273,18 +407,43 @@ for i, cat in enumerate(LOW_PRIORITY):
 # Keys must match entries in CATEGORY_PRIORITY exactly.
 # Will now heavily leverage lowercase normalised merchant strings.
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "education": [
+        # Ed-Tech platforms
+        "udemy", "coursera", "byju", "unacademy", "vedantu", "upgrad",
+        "great learning", "simplilearn", "whitehat jr", "skillshare",
+        "pluralsight", "linkedin learning", "edx", "khan academy",
+        # Dev tools & professional software (common in learner/tech profiles)
+        "github", "gitlab", "oreilly", "jetbrains", "vscode", "notion",
+        "canva", "figma", "zoom", "slack", "trello", "confluence",
+        # Creative/productivity software
+        "adobe",
+        # Cloud training & certifications
+        "aws training", "google cloud", "microsoft azure", "azure",
+        "conf registration", "confregistration",
+        # Generic education signals
+        "tuition", "coaching", "course", "training", "certification",
+        "subscription skill", "workshop", "bootcamp",
+    ],
     "food": [
         "swiggy", "zomato", "domino", "kfc", "mcdonald", "subway", "pizza hut",
-        "burger king", "dunkin", "starbucks", "coffee", "haldiram", "barbeque", 
+        "burger king", "dunkin", "starbucks", "coffee", "haldiram", "barbeque",
         "momo", "ice cream", "bigbasket", "blinkit", "zepto", "dunzo", "jiomart",
         "dmart", "reliance retail", "big bazaar", "grocery", "supermarket",
         "spencer", "spencers",
+        # Local food merchants — canteen, mess, street food, cafes, restaurants
+        "canteen", "mess", "messfee", "hotel", "restaurant", "cafe", "dhaba",
+        "bakery", "sweets", "sweetshop", "juice", "lassi", "chai", "tiffin",
+        "dabba", "fast food", "food court", "eatery", "biryani", "dosa",
+        "saravana", "saravanabhavan", "keralacafe", "localcafe", "streetfood",
+        "kirana", "provision", "vegetables", "fruits",
     ],
     "transport": [
         "uber", "ola", "rapido", "irctc", "indigo", "spicejet", "air india",
         "vistara", "akasa", "makemytrip", "goibibo", "yatra", "redbus", "abhibus",
-        "indian oil", "bharat petroleum", "hindustan petroleum", "fuel", "petrol", 
+        "indian oil", "bharat petroleum", "hindustan petroleum", "fuel", "petrol",
         "diesel", "fastag", "toll",
+        # Local transport
+        "auto", "autodriver", "rickshaw", "cab", "taxi", "metro", "bus", "train",
     ],
     "shopping": [
         "amazon", "flipkart", "myntra", "nykaa", "meesho", "snapdeal", "ajio",
@@ -293,12 +452,21 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     ],
     "utilities": [
         "bescom", "tata power", "msedcl", "kseb", "cesc", "adani", "torrent",
-        "electricity", "water", "internet", "broadband", "jio", "airtel", "vi", 
+        "electricity", "water", "internet", "broadband", "jio", "airtel", "vi",
         "vodafone", "bsnl", "gas", "tata play", "dish tv", "d2h", "sun direct", "utility",
+        # State electricity boards (India)
+        "tneb", "tnebltd", "tangedco", "bescom", "mseb", "uppcl", "cesc", "wbsedcl",
+        "electricity board", "power bill", "eb bill",
+        # Cloud storage & productivity subscriptions
+        "google one", "icloud", "dropbox", "onedrive",
     ],
     "health": [
         "apollo", "netmeds", "1mg", "pharmeasy", "practo", "medlife", "hospital",
         "clinic", "pharmacy", "doctor", "diagnostic", "fortis", "max healthcare",
+        "medplus", "wellness", "health",
+        # Personal care (often miscategorized as food/entertainment)
+        "salon", "parlour", "spa", "beauty salon", "haircut", "grooming",
+        "drclinic", "dental", "optician", "physiotherapy",
     ],
     "finance": [
         "lic", "hdfc", "sbi", "icici", "bajaj finserv", "policybazaar", "zerodha",
@@ -307,11 +475,17 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     ],
     "entertainment": [
         "netflix", "prime", "hotstar", "spotify", "jiocinema", "sonyliv", "zee5",
-        "voot", "altbalaji", "youtube", "saavn", "gaana", "bookmyshow", "dream11", "mpl",
-        "winzo",
+        "voot", "altbalaji", "youtube", "saavn", "gaana", "bookmyshow",
+        # Gaming platforms — placed in entertainment (not education) intentionally
+        "dream11", "mpl", "winzo", "steam", "epic games", "epicgames",
+        "google play", "playstation", "xbox", "nintendo", "ea games",
+        "battlenet", "origin", "gog", "humble bundle",
     ],
     "atm": [
-        "atm", "cash withdrawal", "cash wtdl",
+        # Only match standalone ATM-cash-withdrawal narrations.
+        # 'pos atm purch' prefix is a card POS transaction at a merchant, NOT a cash withdrawal.
+        # The model sees 'pos atm purch othpos meghana foods' and must NOT classify it as atm.
+        "cash withdrawal", "cash wtdl", "atm withdrawal", "atm wtdl", "atm cash",
     ],
     "transfer": [
         "upi transfer", "paytm", "phonepe", "google pay", "bhim", "amazon pay",
@@ -596,6 +770,97 @@ TIP_CORPUS: dict[str, dict] = {
         "categories": (),
         "insights": ("subscription",),
     },
+    # ── Passion / Lifestyle Opportunity Tips ──────────────────────────────────
+    # Routed by: passion_insight_generator._select_tip(category, "lifestyle_opportunity")
+    #
+    # Contract rules (enforced at startup by contracts._freeze_tip_corpus +
+    # bootstrap._dry_render_templates + bootstrap._validate_passion_templates):
+    #   - categories: non-empty tuple of lowercase CATEGORY_KEYWORDS keys (exactly 3 keys total)
+    #   - insights:   exactly ("lifestyle_opportunity",)
+    #   - text:       no Python format fields, no BANNED_DISPLAY_WORDS, no brand names
+    #
+    # Intentional omissions:
+    #   "atm" and "transfer" are excluded. These categories reflect cash management
+    #   and fund routing, not discretionary consumer passion. Adding lifestyle tips
+    #   for them would produce semantically nonsensical output.
+    "tip_food_passion_01": {
+        "text": "Your consistent food spending reflects a real passion for dining. "
+                "A food journal or review page could help you share your experiences.",
+        "categories": ("food",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_food_passion_02": {
+        "text": "You explore a wide variety of food merchants every month. "
+                "Restaurant reviewing or food content creation could be a natural next step.",
+        "categories": ("food",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_shopping_passion_01": {
+        "text": "Your regular retail activity shows a strong eye for useful products. "
+                "A comparison journal or recommendation page could turn this interest into value for others.",
+        "categories": ("shopping",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_shopping_passion_02": {
+        "text": "You explore multiple retail merchants consistently. "
+                "A review blog focused on your favourite finds could resonate with like-minded readers.",
+        "categories": ("shopping",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_entertainment_passion_01": {
+        "text": "Your high entertainment and streaming spend reflects deep media interests. "
+                "Consider launching a review channel, podcast, or media newsletter.",
+        "categories": ("entertainment",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_entertainment_passion_02": {
+        "text": "Your entertainment activity spans multiple platforms. "
+                "Curating a watch list or review blog could resonate with like-minded audiences.",
+        "categories": ("entertainment",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_health_passion_01": {
+        "text": "Your consistent health and wellness spending shows a strong commitment to fitness. "
+                "Sharing your wellness journey through a blog or community group could inspire others.",
+        "categories": ("health",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_transport_passion_01": {
+        "text": "You travel frequently across multiple transport services. "
+                "A travel diary or city-guide blog could be a great outlet for your experiences.",
+        "categories": ("transport",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_finance_passion_01": {
+        "text": "Your disciplined and diverse financial activity shows strong money management habits. "
+                "Sharing those habits through a personal finance blog or community could benefit others.",
+        "categories": ("finance",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_education_passion_01": {
+        "text": "Your consistent investment in courses and learning tools shows a growth mindset. "
+                "Sharing your learning journey through a blog, YouTube channel, or mentoring others could amplify your impact.",
+        "categories": ("education",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_education_passion_02": {
+        "text": "You invest regularly in skill development and professional tools. "
+                "Writing reviews, tutorials, or a learning roadmap could help others on the same path.",
+        "categories": ("education",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_gaming_passion_01": {
+        "text": "Your consistent gaming spend shows deep platform loyalty and enthusiasm. "
+                "Consider streaming, creating guides, or building a gaming community around your interests.",
+        "categories": ("entertainment",),
+        "insights": ("lifestyle_opportunity",),
+    },
+    "tip_gaming_passion_02": {
+        "text": "You invest regularly across gaming platforms and titles. "
+                "A games review blog or content channel could turn your passion into something others benefit from.",
+        "categories": ("entertainment",),
+        "insights": ("lifestyle_opportunity",),
+    },
 }
 
 # ── Insight Templates (multiple phrasings per insight type for variety) ───────
@@ -661,7 +926,25 @@ KNOWN_PERSONS: dict[str, dict] = {
     #     "names": ["sujata devi", "sujata"],
     #     "upi_ids": ["sujata@ybl", "9876543210@paytm"],
     # },
-    
+    "Priya": {
+        "names": ["priya", "priya deka"],
+    },
+    "Rahul":{
+        "names":["rahul","rahul sharma"]
+    },
+    "Souvik":{
+        "names":["souvik","souvik das","souvikdas"]
+    },
+    "anirudhha":{
+        "names":["anirudhha"]
+    },
+    "debanjan":{
+        "names":["debanjan"]
+    },
+    "arnab":{
+        "names":["arnab"]
+    }
+
 }
 
 

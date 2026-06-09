@@ -14,6 +14,12 @@ from config_passion import (
 from passion_utils import assert_columns_exist, safe_numeric, coerce_bool_column
 from logger_factory import get_logger
 
+# Step 2: Import specialized merchant map
+try:
+    from config import SPECIALIZED_MERCHANT_SUBCATEGORY_MAP as _SPECIALIZED_MAP
+except ImportError:
+    _SPECIALIZED_MAP = {}
+
 __all__ = ["resolve_merchant_vectorized", "enrich_subcategories"]
 
 logger = get_logger(__name__)
@@ -110,30 +116,50 @@ def enrich_subcategories(df: pd.DataFrame) -> pd.DataFrame:
     resolved = resolve_merchant_vectorized(result.loc[eligible_mask, Col.CLEANED_REMARKS])
     is_generalist = resolved.isin(GENERALIST_CANONICALS)
 
-    if not is_generalist.any():
-        return result
+    # Generalist path: only run if there are generalist merchants in the eligible rows.
+    # Do NOT return early here — specialized merchant path must still run below.
+    run_generalist = is_generalist.any()
 
     # P3-2: Category-aware enrichment. Check PREDICTED_CATEGORY against
     # allowed set before assigning electronics subcategory.
-    eligible_amounts = numeric_amounts[eligible_mask]
+    if run_generalist:
+        eligible_amounts = numeric_amounts[eligible_mask]
+        for idx in is_generalist[is_generalist].index:
+            canonical = resolved.at[idx]
+            if canonical not in GENERALIST_CANONICALS:
+                continue
+            # P3-2: Gate on PREDICTED_CATEGORY
+            pred_cat = ""
+            if Col.PREDICTED_CATEGORY in result.columns:
+                raw_cat = result.at[idx, Col.PREDICTED_CATEGORY]
+                pred_cat = str(raw_cat).strip().lower() if pd.notna(raw_cat) and str(raw_cat).strip() else ""
 
-    for idx in is_generalist[is_generalist].index:
-        canonical = resolved[idx]
-        if canonical not in GENERALIST_CANONICALS:
-            continue
-        # P3-2: Gate on PREDICTED_CATEGORY
-        pred_cat = ""
-        if Col.PREDICTED_CATEGORY in result.columns:
-            raw_cat = result.at[idx, Col.PREDICTED_CATEGORY]
-            pred_cat = str(raw_cat).strip().lower() if pd.notna(raw_cat) and str(raw_cat).strip() else ""
+            amount = eligible_amounts.get(idx, 0.0)
+            if pred_cat in ELECTRONICS_ALLOWED_CATEGORIES and amount >= MARKETPLACE_HIGH_AMOUNT_THRESHOLD:
+                result.at[idx, Col.INFERRED_SUBCATEGORY] = "electronics"
+                result.at[idx, Col.SUBCATEGORY_CONFIDENCE] = MARKETPLACE_HIGH_CONFIDENCE
+            else:
+                result.at[idx, Col.INFERRED_SUBCATEGORY] = "general_purchase"
+                result.at[idx, Col.SUBCATEGORY_CONFIDENCE] = MARKETPLACE_LOW_CONFIDENCE
 
-        amount = eligible_amounts.get(idx, 0.0)
-        if pred_cat in ELECTRONICS_ALLOWED_CATEGORIES and amount >= MARKETPLACE_HIGH_AMOUNT_THRESHOLD:
-            result.at[idx, Col.INFERRED_SUBCATEGORY] = "electronics"
-            result.at[idx, Col.SUBCATEGORY_CONFIDENCE] = MARKETPLACE_HIGH_CONFIDENCE
-        else:
-            result.at[idx, Col.INFERRED_SUBCATEGORY] = "general_purchase"
-            result.at[idx, Col.SUBCATEGORY_CONFIDENCE] = MARKETPLACE_LOW_CONFIDENCE
+    # Step 2: Deterministic subcategory for specialized merchants.
+    # Runs regardless of whether any generalist merchants were found.
+    # Only touches eligible rows that are still pd.NA (not yet enriched).
+    # IMPORTANT: Reuses the already-computed `resolved` Series from the generalist
+    # call above (line 110). Do NOT call resolve_merchant_vectorized a second time —
+    # that would re-resolve an already-resolved subset, wasting CPU and adding a
+    # redundant function call whose result is identical (pure function).
+    if _SPECIALIZED_MAP:
+        unenriched_mask = eligible_mask & result[Col.INFERRED_SUBCATEGORY].isna()
+        if unenriched_mask.any():
+            unenriched_idx = unenriched_mask[unenriched_mask].index
+            for idx in unenriched_idx:
+                if idx not in resolved.index:
+                    continue
+                subcat = _SPECIALIZED_MAP.get(resolved.at[idx])
+                if subcat:
+                    result.at[idx, Col.INFERRED_SUBCATEGORY] = subcat
+                    result.at[idx, Col.SUBCATEGORY_CONFIDENCE] = MARKETPLACE_HIGH_CONFIDENCE
 
     # Blocker 5: Prevent invalid/known rows from receiving subcategory enrichment.
     ineligible_idx = result[~eligible_mask].index

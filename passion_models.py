@@ -28,6 +28,8 @@ class PassionSignal:
     latest_ts: int = 0
     original_index: int = 0
     active_months: int = 0
+    # Subcategory signal — empty string means no subcategory resolved.
+    subcategory: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, str) or not self.category.strip():
@@ -88,6 +90,11 @@ class PassionSignal:
         # P0-2: active_months validation
         if not isinstance(self.active_months, (int, np.integer)) or self.active_months < 0:
             raise ValueError("active_months must be a non-negative integer")
+
+        if not isinstance(self.subcategory, str):
+            raise TypeError("subcategory must be str")
+        # Normalize: lowercase, strip, spaces become underscores
+        object.__setattr__(self, "subcategory", str(self.subcategory).strip().lower().replace(" ", "_"))
 
         # Fix 11: Normalize scalar fields to native Python types after all validation.
         # Prevents numpy scalars from leaking into logs, JSON, and downstream consumers.

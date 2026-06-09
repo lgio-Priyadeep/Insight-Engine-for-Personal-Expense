@@ -20,6 +20,19 @@ from passion_utils import safe_numeric
 from marketplace_subcategory import resolve_merchant_vectorized
 from passion_models import PassionSignal
 
+# Step 4b: Guarded import for per-subcategory merchant count overrides.
+# Falls back to empty dict if SUBCATEGORY_MERCHANT_COUNT_MIN not yet deployed.
+try:
+    from config_passion import SUBCATEGORY_MERCHANT_COUNT_MIN as _SUBCATEGORY_MIN
+except ImportError:
+    _SUBCATEGORY_MIN: dict[str, int] = {}
+
+# Guarded import for blocked categories (ATM, finance, utilities are never passions).
+try:
+    from config_passion import PASSION_BLOCKED_CATEGORIES as _BLOCKED_CATEGORIES
+except ImportError:
+    _BLOCKED_CATEGORIES: frozenset[str] = frozenset()
+
 # FIX H11: Use structured logger from logger_factory instead of plain logging.
 from logger_factory import get_logger
 
@@ -38,6 +51,26 @@ _FEE_PATTERN = re.compile(
         re.escape(kw) for kw in sorted(_FEE_KEYWORDS, key=len, reverse=True)
     ) + r')(?!\w)',
     flags=re.IGNORECASE,
+)
+
+# Step 4c (D2 approved): Education-specific exemption.
+# These remarks contain "fee" or "charge" but represent legitimate passion spending,
+# not financial distress. The lookbehind (?<!\w) and lookahead (?!\w) prevent partial
+# matches. fees? matches both singular ("fee") and plural ("fees") — Indian transaction
+# data commonly uses plural forms ("tuition fees", "exam fees").
+_EDUCATION_EXEMPTION_PATTERN = re.compile(
+    r'(?<!\w)(?:tuition|course|exam|admission|registration|class|training)\s*fees?(?!\w)',
+    re.IGNORECASE,
+)
+
+# Non-passion merchant pattern: regex matching descriptions that represent structural
+# (non-discretionary) spend regardless of predicted category.
+# Common in Indian UPI data: rent via "landlord <name> oid", maid/cook payments,
+# society maintenance, etc. These must be excluded from unique_merchants before gate
+# evaluation to prevent them from inflating passion merchant counts.
+_NON_PASSION_MERCHANT_PATTERN = re.compile(
+    r'(?<!\w)(?:landlord|rent|maid|cook|society|maintenance|servant|househelp)\b',
+    re.IGNORECASE,
 )
 
 
@@ -87,7 +120,12 @@ def _check_distress_gate(cat_df: pd.DataFrame) -> bool:
         return False
     # P3-5: Use total row count as denominator, not non-null remark count.
     total_rows = len(cat_df)
-    fee_count = cat_df[Col.CLEANED_REMARKS].fillna("").astype(str).str.contains(_FEE_PATTERN, regex=True, na=False).sum()
+    remarks = cat_df[Col.CLEANED_REMARKS].fillna("").astype(str)
+    # Step 4c: Exclude education-exempt remarks from fee counting.
+    # "tuition fee", "course fee", "exam fee" etc. contain fee/charge keywords but
+    # represent legitimate passion spending, not financial distress.
+    non_exempt = remarks[~remarks.str.contains(_EDUCATION_EXEMPTION_PATTERN, regex=True, na=False)]
+    fee_count = non_exempt.str.contains(_FEE_PATTERN, regex=True, na=False).sum()
     ratio = fee_count / total_rows if total_rows > 0 else 0.0
     return bool(ratio > DISTRESS_FEES_THRESHOLD)
 
@@ -207,10 +245,48 @@ def detect_passions(
     if total_spend <= 0:
         return []
 
+    # Step 4a: Ensure INFERRED_SUBCATEGORY column is present with a safe default.
+    # This guards against callers that built spend_df without running enrich_subcategories.
+    # Single copy — branch on column presence, not twice.
+    spend_df = spend_df.copy()
+    if Col.INFERRED_SUBCATEGORY not in spend_df.columns:
+        spend_df[Col.INFERRED_SUBCATEGORY] = ""
+    else:
+        # fillna → astype(str) converts pd.NA to the string "nan".
+        # The subsequent .replace({"nan": ""}) cleans those up.
+        # Order matters: fillna first, then astype, then strip, then replace.
+        spend_df[Col.INFERRED_SUBCATEGORY] = (
+            spend_df[Col.INFERRED_SUBCATEGORY]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .replace({"nan": ""})
+        )
+
     signals: list[PassionSignal] = []
 
-    for category, cat_df in spend_df.groupby(Col.PREDICTED_CATEGORY):
+    # Pre-compute per-category spend totals for subcategory-relative share calculation.
+    # When a subcategory group is evaluated, spend_share is computed against the parent
+    # category total (not global total) — otherwise each subcategory fragment appears tiny.
+    # e.g. Myntra (fashion) = 100% of shopping spend, not 13% of all spend.
+    category_spend_totals: dict[str, float] = (
+        numeric_amounts.groupby(spend_df[Col.PREDICTED_CATEGORY]).sum().to_dict()
+    )
+
+    for (category, subcategory), cat_df in spend_df.groupby(
+        [Col.PREDICTED_CATEGORY, Col.INFERRED_SUBCATEGORY],
+        dropna=False,
+    ):
+        subcategory = (
+            ""
+            if (subcategory is None or str(subcategory).strip().lower() in ("nan", "none", "<na>", ""))
+            else str(subcategory).strip().lower()
+        )
         if not isinstance(category, str) or not category.strip():
+            continue
+        # Block structural categories that can never be lifestyle passions.
+        if category.strip().lower() in _BLOCKED_CATEGORIES:
             continue
 
         # I5: Use resolved_merchants if provided, else use CLEANED_REMARKS.
@@ -221,22 +297,40 @@ def detect_passions(
         else:
             merchants = cat_df[Col.CLEANED_REMARKS]
 
-        # Drop/ignore NaN merchants explicitly to prevent "nan" strings from being added
+        # Drop/ignore NaN merchants and structural non-passion merchant patterns.
+        # _NON_PASSION_MERCHANT_PATTERN filters rent, landlord, maid etc. regardless of
+        # predicted category (the ML model can mis-assign rent to education/food/shopping).
         unique_merchants = tuple(sorted(set(
             str(m) for m in merchants
-            if not _safe_isna(m) and str(m).strip() != "" and str(m).lower() != "nan"
+            if (not _safe_isna(m) and str(m).strip() != "" and str(m).lower() != "nan"
+                and not _NON_PASSION_MERCHANT_PATTERN.search(str(m)))
         )))
 
-        if len(unique_merchants) < PASSION_MERCHANT_COUNT_MIN:
+        # Step 4b: Subcategory-aware merchant count gate.
+        # Uses _SUBCATEGORY_MIN (imported with fallback) — safe if D1 not yet applied.
+        effective_min = _SUBCATEGORY_MIN.get(
+            subcategory, PASSION_MERCHANT_COUNT_MIN
+        ) if subcategory else PASSION_MERCHANT_COUNT_MIN
+        if len(unique_merchants) < effective_min:
             continue
 
         cat_spend = numeric_amounts.loc[cat_df.index].sum()
         if cat_spend <= 0:
             continue
 
-        spend_share = cat_spend / total_spend if total_spend > 0 else 0.0
+        # Gate uses parent-category share for subcategory groups to prevent fragmentation dilution.
+        # e.g. Myntra (fashion) = 35% of shopping spend → valid passion even if only 13% of total.
+        # Display always uses global total_spend so reported percentages are honest and comparable.
+        if subcategory:
+            parent_total = category_spend_totals.get(str(category), total_spend)
+            gate_denominator = parent_total if parent_total > 0 else total_spend
+        else:
+            gate_denominator = total_spend
+        gate_share = cat_spend / gate_denominator if gate_denominator > 0 else 0.0
+        # Display share: always relative to global total spend for honest user-facing numbers.
+        display_share = cat_spend / total_spend if total_spend > 0 else 0.0
 
-        if spend_share < PASSION_SPEND_SHARE_THRESHOLD:
+        if gate_share < PASSION_SPEND_SHARE_THRESHOLD:
             continue
 
         # FIX 10 & 19: Calculate dates, active_months, latest_ts, and original_index FIRST
@@ -278,13 +372,14 @@ def detect_passions(
                 merchant_list=unique_merchants,
                 total_spend=float(cat_spend),
                 merchant_count=len(unique_merchants),
-                spend_share=float(spend_share),
+                spend_share=float(display_share),
                 trend_direction="suppressed",
                 is_suppressed=True,
                 suppression_reason="distress_gate",
                 latest_ts=latest_ts,
                 original_index=original_index,
                 active_months=active_months,
+                subcategory=subcategory,
             ))
             continue
 
@@ -294,13 +389,14 @@ def detect_passions(
                 merchant_list=unique_merchants,
                 total_spend=float(cat_spend),
                 merchant_count=len(unique_merchants),
-                spend_share=float(spend_share),
+                spend_share=float(display_share),
                 trend_direction="suppressed",
                 is_suppressed=True,
                 suppression_reason="anomaly_suppression",
                 latest_ts=latest_ts,
                 original_index=original_index,
                 active_months=active_months,
+                subcategory=subcategory,
             ))
             continue
 
@@ -315,12 +411,13 @@ def detect_passions(
             merchant_list=unique_merchants,
             total_spend=float(cat_spend),
             merchant_count=len(unique_merchants),
-            spend_share=float(spend_share),
+            spend_share=float(display_share),
             trend_direction=trend,
             is_suppressed=False,
             latest_ts=latest_ts,
             original_index=original_index,
             active_months=active_months,
+            subcategory=subcategory,
         ))
 
     return signals
