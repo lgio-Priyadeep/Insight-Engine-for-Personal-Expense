@@ -988,3 +988,11 @@ PERSONAL_RECURRING_CONFIG: dict[str, dict] = {
         "fluctuation_penalty_threshold": 0.20,  # RECURRING_CONFIG uses 0.10
     }
 }
+
+# ── LLM Export Configuration ──────────────────────────────────────────────────
+# All caps configurable via env vars. Defaults keep context window manageable.
+LLM_EXPORT_MAX_ANOMALIES        = int(os.getenv("INSIGHT_LLM_MAX_ANOMALIES", "10"))
+LLM_EXPORT_MAX_CATEGORIES       = int(os.getenv("INSIGHT_LLM_MAX_CATEGORIES", "15"))
+LLM_EXPORT_MAX_PASSION_SIGNALS  = int(os.getenv("INSIGHT_LLM_MAX_PASSION_SIGNALS", "5"))
+LLM_EXPORT_MAX_SUBSCRIPTIONS    = int(os.getenv("INSIGHT_LLM_MAX_SUBSCRIPTIONS", "10"))
+LLM_EXPORT_OUTPUT_DIR           = os.getenv("INSIGHT_LLM_EXPORT_DIR", "output/llm_context")
