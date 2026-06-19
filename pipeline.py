@@ -441,7 +441,7 @@ def _attach_passion_results(
     # take effect without restart. Default is now false!
     import os as _os
     enabled = _os.environ.get(
-        "INSIGHT_ENGINE_PASSION_ENABLED", "false"
+        "INSIGHT_ENGINE_PASSION_ENABLED", "true"
     ).lower() == "true"
 
     if not enabled:

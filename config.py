@@ -996,3 +996,13 @@ LLM_EXPORT_MAX_CATEGORIES       = int(os.getenv("INSIGHT_LLM_MAX_CATEGORIES", "1
 LLM_EXPORT_MAX_PASSION_SIGNALS  = int(os.getenv("INSIGHT_LLM_MAX_PASSION_SIGNALS", "5"))
 LLM_EXPORT_MAX_SUBSCRIPTIONS    = int(os.getenv("INSIGHT_LLM_MAX_SUBSCRIPTIONS", "10"))
 LLM_EXPORT_OUTPUT_DIR           = os.getenv("INSIGHT_LLM_EXPORT_DIR", "output/llm_context")
+
+# ── Chatbot Configuration ─────────────────────────────────────────────────────
+CHATBOT_MODEL_PATH          = os.getenv("INSIGHT_CHATBOT_MODEL", "models/llama-3.2-3b-instruct-q4_k_m.gguf")
+CHATBOT_N_CTX               = int(os.getenv("INSIGHT_CHATBOT_N_CTX", "4096"))
+CHATBOT_N_THREADS           = int(os.getenv("INSIGHT_CHATBOT_N_THREADS", "4"))
+CHATBOT_TIMEOUT_S           = int(os.getenv("INSIGHT_CHATBOT_TIMEOUT_S", "400"))
+CHATBOT_MAX_RESPONSE_TOKENS = int(os.getenv("INSIGHT_CHATBOT_MAX_TOKENS", "512"))
+CHATBOT_MAX_TURNS           = int(os.getenv("INSIGHT_CHATBOT_MAX_TURNS", "10"))
+CHATBOT_HISTORY_WINDOW      = int(os.getenv("INSIGHT_CHATBOT_HISTORY_WINDOW", "6"))
+CHATBOT_SESSION_TTL_S       = int(os.getenv("INSIGHT_CHATBOT_SESSION_TTL_S", "1800"))

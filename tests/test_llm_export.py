@@ -164,11 +164,10 @@ def test_recurring_section_capped(llm_context):
 # 7. test_passion_disabled_graceful
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_passion_disabled_graceful(pipeline_result):
+def test_passion_disabled_graceful(pipeline_result, monkeypatch):
     """When passion feature is not enabled (default), passion_insights.enabled=False and no crash."""
-    # INSIGHT_ENGINE_PASSION_ENABLED is an env-var gate, not a config attribute.
-    # build_passion_context uses getattr(config, "INSIGHT_ENGINE_PASSION_ENABLED", False)
-    # which defaults to False — no patch needed.
+    # INSIGHT_ENGINE_PASSION_ENABLED is an os.environ gate (CP-01 C1b fix).
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "false")
     ctx = build_llm_context(pipeline_result)
     pi = ctx.get("passion_insights", {})
     assert pi.get("enabled") is False
@@ -179,8 +178,8 @@ def test_passion_disabled_graceful(pipeline_result):
 # 8. test_passion_suppressed_signals_excluded
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_passion_suppressed_signals_excluded():
-    """Suppressed signals are excluded from the export."""
+def test_passion_suppressed_signals_excluded(monkeypatch):
+    """Suppressed signals are excluded from the export (gate activated via env-var)."""
     from llm_export_passion import build_passion_context
 
     suppressed = MagicMock()
@@ -197,9 +196,12 @@ def test_passion_suppressed_signals_excluded():
     mock_result = MagicMock()
     mock_result.passion_signals = (suppressed,)
 
-    with patch.object(config, "INSIGHT_ENGINE_PASSION_ENABLED", True, create=True):
-        ctx = build_passion_context(mock_result, pii_safe=True)
+    # Gate is now os.environ (CP-01 C1b). Use monkeypatch — not config patch.
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "true")
+    ctx = build_passion_context(mock_result, pii_safe=True)
 
+    # enabled=True (gate open), but signal is suppressed → excluded
+    assert ctx["enabled"] is True
     assert ctx["signal_count"] == 0
     assert ctx["signals"] == []
 
@@ -604,3 +606,82 @@ def test_exclusion_rate_fallback_formula():
     assert pt["exclusion_rate_pct"] == pytest.approx(expected_rate, rel=1e-3), (
         f"Fallback exclusion_rate_pct: expected {expected_rate}, got {pt['exclusion_rate_pct']}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 27. test_passion_context_reads_os_environ_enabled
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_passion_context_reads_os_environ_enabled(monkeypatch):
+    """build_passion_context returns enabled=True when env-var is 'true' (C1b)."""
+    from llm_export_passion import build_passion_context
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "true")
+    mock_result = MagicMock()
+    mock_result.passion_signals = ()
+    ctx = build_passion_context(mock_result, pii_safe=True)
+    assert ctx["enabled"] is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 28. test_passion_context_reads_os_environ_disabled
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_passion_context_reads_os_environ_disabled(monkeypatch):
+    """build_passion_context returns enabled=False when env-var is 'false' (C1b)."""
+    from llm_export_passion import build_passion_context
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "false")
+    mock_result = MagicMock()
+    mock_result.passion_signals = ()
+    ctx = build_passion_context(mock_result, pii_safe=True)
+    assert ctx["enabled"] is False
+    assert ctx["signals"] == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 29. test_build_spend_insights_paired_objects
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_build_spend_insights_paired_objects():
+    """build_spend_insights returns paired objects with tip always present (C2/C6)."""
+    from llm_export_aggregators import build_spend_insights
+    records = [
+        {"type": "spending_spike", "text": "Anomaly at X", "tip": "Tip A", "score": 0.9},
+        {"type": "subscription",   "text": "Sub at Y",    "tip": "",      "score": 0.7},
+    ]
+    stats_in = {"total_transactions": 100, "excluded_transactions": 5, "exclusion_rate": 0.05}
+    out = build_spend_insights(records, stats_in)
+    assert len(out["insights"]) == 2
+    assert out["insights"][0]["tip"] == "Tip A"
+    assert out["insights"][1]["tip"] == ""
+    assert out["insights"][0]["score"] == pytest.approx(0.9)
+    assert out["stats"]["total_transactions"] == 100
+    assert out["stats"]["exclusion_rate"] == pytest.approx(0.05)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 30. test_build_spend_insights_empty_records
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_build_spend_insights_empty_records():
+    """Empty insight_records → insights=[], stats all zeros."""
+    from llm_export_aggregators import build_spend_insights
+    out = build_spend_insights([], {})
+    assert out["insights"] == []
+    assert out["stats"]["total_transactions"] == 0
+    assert out["stats"]["exclusion_rate"] == 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 31. test_build_spend_insights_skips_empty_text
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_build_spend_insights_skips_empty_text():
+    """Records with empty text are filtered — malformed record guard."""
+    from llm_export_aggregators import build_spend_insights
+    records = [
+        {"type": "spending_spike", "text": "",      "tip": "t", "score": 0.5},
+        {"type": "subscription",   "text": "Valid", "tip": "",  "score": 0.3},
+    ]
+    out = build_spend_insights(records, {})
+    assert len(out["insights"]) == 1
+    assert out["insights"][0]["text"] == "Valid"

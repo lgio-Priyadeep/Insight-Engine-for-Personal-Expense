@@ -167,6 +167,9 @@ def build_llm_context(result: "PipelineResult") -> dict:
 def export_to_json(
     result: "PipelineResult",
     output_path: str | None = None,
+    *,
+    user_id: str | None = None,
+    run_id: str | None = None,
 ) -> str:
     """
     Build LLM context and write it atomically to disk as JSON.
@@ -196,13 +199,14 @@ def export_to_json(
         ValueError: if result.debits is empty or missing required columns.
         OSError:    on file system write failure.
     """
-    export_id = uuid4().hex[:12]
+    export_id = run_id if run_id is not None else uuid4().hex[:12]
 
     context = build_llm_context(result)
     context["run_id"] = export_id  # Inject run_id into the in-memory dict before serializing
 
     if output_path is None:
-        output_dir = getattr(config, "LLM_EXPORT_OUTPUT_DIR", "output/llm_context")
+        base_dir   = getattr(config, "LLM_EXPORT_OUTPUT_DIR", "output/llm_context")
+        output_dir = os.path.join(base_dir, user_id) if user_id is not None else base_dir
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{export_id}_llm_context.json")
 

@@ -1032,7 +1032,7 @@ class TestPipeline:
       assert attached.passion_insights == ("passion insight",)
 
   def test_attach_passion_results_disabled_does_not_call_process(self, monkeypatch):
-      monkeypatch.delenv("INSIGHT_ENGINE_PASSION_ENABLED", raising=False)
+      monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "false")
       import pipeline
       from unittest.mock import MagicMock
       result = make_pipeline_result(
@@ -2072,7 +2072,7 @@ class TestE3PassionEngineE2EIntegration:
 
   def test_attach_passion_results_e2e_disabled_leaves_fields_empty(self, monkeypatch):
       """E3/E2: With PASSION_ENABLED unset, _attach_passion_results returns result unchanged."""
-      monkeypatch.delenv("INSIGHT_ENGINE_PASSION_ENABLED", raising=False)
+      monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "false")
       monkeypatch.setenv("ENV", "test")
       monkeypatch.setenv("INSIGHT_ENGINE_SKIP_STARTUP_CHECKS", "true")
 

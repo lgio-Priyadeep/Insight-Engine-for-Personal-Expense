@@ -3,3 +3,12 @@ pandas>=3.0,<4
 scikit-learn>=1.8,<2
 lightgbm>=4.6,<5
 scipy>=1.17,<2
+
+# API Core & Router
+fastapi==0.137.2
+uvicorn==0.43.0
+pydantic==2.12.5
+
+# Chatbot inference engine (CPU-only by default. To utilize NVIDIA GPU/CUDA:
+# CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python==0.3.1 --force-reinstall --upgrade --no-cache-dir)
+llama-cpp-python==0.3.1

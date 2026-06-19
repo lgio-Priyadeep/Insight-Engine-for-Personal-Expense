@@ -480,3 +480,52 @@ def build_budget_health(
         "declining_categories": declining_categories,
         "risk_flags": risk_flags,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. build_spend_insights
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_spend_insights(
+    insight_records: list,
+    exclusion_stats: dict,
+) -> dict:
+    """
+    Build the spend_insights section of the API response.
+
+    Uses paired objects — text + tip co-located per record — to avoid
+    parallel-array index-alignment breakage (conflict C6).
+
+    Source MUST be _generate_insight_records(), NOT result.insights.
+    result.insights merges personal-transfer strings (pipeline.py:716)
+    that are not spend anomalies and would render incorrectly as spend cards.
+
+    Args:
+        insight_records: Output of _generate_insight_records() —
+                         list of {type, text, tip, score} dicts.
+        exclusion_stats: result.exclusion_stats dict.
+
+    Returns:
+        dict with keys:
+            insights : list of {text, tip, type, score}
+                       tip is "" when no tip exists — never omitted.
+            stats    : {total_transactions, excluded_transactions, exclusion_rate}
+    """
+    paired = [
+        {
+            "text":  str(r.get("text", "")),
+            "tip":   str(r.get("tip", "")),
+            "type":  str(r.get("type", "")),
+            "score": _safe_float(r.get("score", 0.0)),
+        }
+        for r in (insight_records or [])
+        if r.get("text")  # guard: skip malformed empty-text records
+    ]
+
+    stats = {
+        "total_transactions":   int(exclusion_stats.get("total_transactions", 0)),
+        "excluded_transactions": int(exclusion_stats.get("excluded_transactions", 0)),
+        "exclusion_rate":       _safe_float(exclusion_stats.get("exclusion_rate", 0.0)),
+    }
+
+    return {"insights": paired, "stats": stats}

@@ -18,6 +18,7 @@ Field derivation rules (per plan U2):
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Sequence
 
 import config
@@ -79,7 +80,7 @@ def build_passion_context(result: "PipelineResult", pii_safe: bool) -> dict:
     Build the passion_insights section of the LLM context dict.
 
     Rules:
-        - passion feature must be enabled (config.INSIGHT_ENGINE_PASSION_ENABLED).
+        - passion feature must be enabled (env: INSIGHT_ENGINE_PASSION_ENABLED=true).
         - Only non-suppressed signals are exported.
         - Capped at config.LLM_EXPORT_MAX_PASSION_SIGNALS.
         - If passion is disabled or no signals exist, returns {"enabled": False, "signals": []}.
@@ -91,7 +92,7 @@ def build_passion_context(result: "PipelineResult", pii_safe: bool) -> dict:
     Returns:
         dict with keys: enabled, signal_count, signals.
     """
-    passion_enabled = getattr(config, "INSIGHT_ENGINE_PASSION_ENABLED", False)
+    passion_enabled = os.environ.get("INSIGHT_ENGINE_PASSION_ENABLED", "true").lower() == "true"
 
     if not passion_enabled:
         logger.debug("Passion feature disabled — returning empty passion context.")

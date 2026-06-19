@@ -72,3 +72,8 @@ if passion_status == "success" and not results.passion_debits.empty:
     passion_out_path = os.path.join(output_dir, "passion_enriched_debits.csv")
     results.passion_debits.to_csv(passion_out_path, index=False)
     print(f"Saved passion enriched debits to {passion_out_path}")
+
+# 8. Save LLM context JSON for chatbot use
+from llm_export import export_to_json
+context_path = export_to_json(results)
+print(f"Saved LLM context to {context_path}")
