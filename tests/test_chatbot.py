@@ -296,3 +296,61 @@ class TestGenerateResponse:
             with patch.object(config, "CHATBOT_MODEL_PATH", str(tmp_path / "missing.gguf")):
                 with pytest.raises(chatbot_engine.ModelNotReadyError, match="not found"):
                     chatbot_engine._get_llm_instance()
+
+
+# ── chatbot_prompt_builder — tip rendering ────────────────────────────────────
+
+class TestBuildSystemPromptWithTips:
+    def _ctx(self, **overrides) -> dict:
+        base = {
+            "period": {"start": "2024-01-01", "end": "2024-03-31"},
+            "spend_profile": [],
+            "expense_insights": [],
+            "recurring_subscriptions": [],
+            "passion_insights": {},
+            "budget_health": {},
+        }
+        base.update(overrides)
+        return base
+
+    def test_build_prompt_includes_passion_signals_with_tips(self):
+        """Passion signal with a tip produces '... Tip: ...' line in prompt."""
+        from chatbot_prompt_builder import build_system_prompt
+        ctx = self._ctx(passion_insights={
+            "enabled": True,
+            "signal_count": 1,
+            "signals": [
+                {
+                    "display_label": "Fitness",
+                    "spend_share_pct": 22.5,
+                    "tip": "Check for group class discounts.",
+                }
+            ],
+        })
+        prompt = build_system_prompt(ctx)
+        assert "Fitness" in prompt
+        assert "22.5" in prompt
+        assert "Check for group class discounts." in prompt
+        assert "Tip:" in prompt
+
+    def test_build_prompt_passion_signal_without_tip_no_tip_line(self):
+        """Passion signal with tip='' produces no 'Tip:' in that line."""
+        from chatbot_prompt_builder import build_system_prompt
+        ctx = self._ctx(passion_insights={
+            "enabled": True,
+            "signal_count": 1,
+            "signals": [
+                {
+                    "display_label": "Food",
+                    "spend_share_pct": 30.0,
+                    "tip": "",
+                }
+            ],
+        })
+        prompt = build_system_prompt(ctx)
+        assert "Food" in prompt
+        # Tip line must NOT appear when tip is empty
+        for line in prompt.splitlines():
+            if "Food" in line:
+                assert "Tip:" not in line, f"Unexpected Tip in line: {line!r}"
+

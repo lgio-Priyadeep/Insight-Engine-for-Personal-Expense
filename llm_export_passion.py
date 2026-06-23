@@ -42,7 +42,7 @@ def _serialize_passion_signal(sig: "PassionSignal", pii_safe: bool) -> dict:
     Returns:
         dict with keys: category, subcategory, display_label, total_spend,
         spend_share_pct, merchant_count, active_months, trend, is_suppressed,
-        suppression_reason, narrative.
+        suppression_reason, narrative, tip.
     """
     # display_label: prefer subcategory, fall back to category
     if sig.subcategory:
@@ -72,6 +72,7 @@ def _serialize_passion_signal(sig: "PassionSignal", pii_safe: bool) -> dict:
         "is_suppressed": bool(sig.is_suppressed),
         "suppression_reason": sig.suppression_reason or "",
         "narrative": narrative,
+        "tip": sig.tip,
     }
 
 

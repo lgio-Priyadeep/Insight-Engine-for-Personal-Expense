@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import re as _re
 from dataclasses import dataclass
 from typing import Final
 import numpy as np
@@ -30,6 +31,9 @@ class PassionSignal:
     active_months: int = 0
     # Subcategory signal — empty string means no subcategory resolved.
     subcategory: str = ""
+    # Rendered tip string — empty string means no tip generated.
+    # Never a raw template; rendering and banned-content filtering happen in passion_pipeline.
+    tip: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, str) or not self.category.strip():
@@ -95,6 +99,21 @@ class PassionSignal:
             raise TypeError("subcategory must be str")
         # Normalize: lowercase, strip, spaces become underscores
         object.__setattr__(self, "subcategory", str(self.subcategory).strip().lower().replace(" ", "_"))
+
+        # tip validation — must be a fully-rendered string, never a raw template.
+        if not isinstance(self.tip, str):
+            raise TypeError("tip must be str")
+        _stripped_tip = self.tip.strip()
+        # Reject whitespace-only strings (non-empty before strip, empty after).
+        if self.tip and not _stripped_tip:
+            raise ValueError("tip must not be whitespace-only")
+        object.__setattr__(self, "tip", _stripped_tip)
+        # Reject unrendered Python-identifier placeholders, e.g. {category}, {subcategory}.
+        # The tightened pattern avoids false positives on {$500}, {8/10}, etc.
+        if _stripped_tip and _re.search(r'\{[a-zA-Z_]\w*\}', _stripped_tip):
+            raise ValueError(
+                f"tip contains unrendered template placeholder — render before constructing PassionSignal: {_stripped_tip!r}"
+            )
 
         # Fix 11: Normalize scalar fields to native Python types after all validation.
         # Prevents numpy scalars from leaking into logs, JSON, and downstream consumers.

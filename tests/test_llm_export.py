@@ -685,3 +685,71 @@ def test_build_spend_insights_skips_empty_text():
     out = build_spend_insights(records, {})
     assert len(out["insights"]) == 1
     assert out["insights"][0]["text"] == "Valid"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 32. test_passion_context_tip_populated
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_passion_context_tip_populated(monkeypatch):
+    """build_passion_context serializes sig.tip into each signal dict."""
+    from llm_export_passion import build_passion_context
+    from passion_models import PassionSignal
+
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "true")
+
+    sig = PassionSignal(
+        category="fitness",
+        merchant_list=("gym_hq",),
+        total_spend=5000.0,
+        merchant_count=1,
+        spend_share=0.25,
+        trend_direction="non_declining",
+        active_months=3,
+        latest_ts=1_700_000_000,
+        original_index=0,
+        tip="Try a trial class before committing.",
+    )
+
+    mock_result = MagicMock()
+    mock_result.passion_signals = (sig,)
+
+    ctx = build_passion_context(mock_result, pii_safe=True)
+
+    assert ctx["enabled"] is True
+    assert len(ctx["signals"]) == 1
+    serialized = ctx["signals"][0]
+    assert "tip" in serialized, "serialized signal must contain 'tip' key"
+    assert serialized["tip"] == "Try a trial class before committing."
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 33. test_passion_context_tip_empty_when_not_set
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_passion_context_tip_empty_when_not_set(monkeypatch):
+    """When no tip is generated (default ''), serialized signal has tip=''."""
+    from llm_export_passion import build_passion_context
+    from passion_models import PassionSignal
+
+    monkeypatch.setenv("INSIGHT_ENGINE_PASSION_ENABLED", "true")
+
+    sig = PassionSignal(
+        category="food",
+        merchant_list=("zomato",),
+        total_spend=3000.0,
+        merchant_count=1,
+        spend_share=0.15,
+        trend_direction="non_declining",
+        active_months=2,
+        latest_ts=1_700_000_000,
+        original_index=0,
+        # tip omitted — defaults to ""
+    )
+
+    mock_result = MagicMock()
+    mock_result.passion_signals = (sig,)
+
+    ctx = build_passion_context(mock_result, pii_safe=True)
+    assert ctx["signals"][0]["tip"] == ""
+

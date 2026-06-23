@@ -14,6 +14,7 @@ import time
 import math
 import datetime
 import threading
+import dataclasses
 import random
 import pandas as pd
 import numpy as np
@@ -532,6 +533,60 @@ def process_pipeline(
         return _neutral_passion_result(df_raw, reason="substage_failure")
 
     budget.check("passion_detection")
+
+    # ── Tip generation — attach rendered tip to each signal before insight wiring ──
+    # Tips are generated here (not in the serializer) so that:
+    #   1. The pipeline's deterministic rng instance is used correctly.
+    #   2. contains_banned_content filtering is applied before storing.
+    #   3. Unrendered template strings never reach PassionSignal.
+    try:
+        from passion_insight_generator import _select_tip
+        from passion_utils import validate_template_values
+
+        _enriched: list = []
+        for _sig in passion_signals:
+            _tip = ""
+            if not _sig.is_suppressed:
+                try:
+                    _values = {
+                        "category": _sig.category,
+                        "merchant_count": _sig.merchant_count,
+                        "merchant_label": (
+                            f"{_sig.merchant_count} merchant"
+                            if _sig.merchant_count == 1
+                            else f"{_sig.merchant_count} merchants"
+                        ),
+                        "spend_share": _sig.spend_share,
+                        "total_spend": _sig.total_spend,
+                        "trend_direction": _sig.trend_direction,
+                        "subcategory": _sig.subcategory,
+                    }
+                    validate_template_values(_values)
+                    _tmpl = _select_tip(
+                        _sig.category, "lifestyle_opportunity", rng,
+                        subcategory=_sig.subcategory,
+                    )
+                    if _tmpl:
+                        _rendered = _tmpl.format(**_values)
+                        if not contains_banned_content(_rendered):
+                            _tip = _rendered
+                except Exception as _tip_exc:
+                    logger.warning(
+                        "passion_tip_generation_failed",
+                        extra={
+                            "category": _sig.category,
+                            "error_type": type(_tip_exc).__name__,
+                        },
+                    )
+            _enriched.append(dataclasses.replace(_sig, tip=_tip))
+        passion_signals = tuple(_enriched)
+    except Exception as e:
+        if _should_reraise(e, strict_mode):
+            raise
+        logger.warning("passion_tip_enrichment_failed", extra={"error_type": type(e).__name__})
+        return _neutral_passion_result(df_raw, reason="substage_failure")
+
+    budget.check("tip_generation")
 
     # Wire PassionSignals to insight generation
     def _signal_to_candidate(sig) -> Candidate:

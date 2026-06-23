@@ -51,6 +51,7 @@ class PassionSignalOut(BaseModel):
     is_suppressed:     bool
     suppression_reason: str
     narrative:         str
+    tip:               str   # "" when no tip was generated — always present, never omitted
 
 
 class PassionInsights(BaseModel):

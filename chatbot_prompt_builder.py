@@ -90,7 +90,11 @@ def build_system_prompt(context: dict) -> str:
         for sig in signals:
             label = sig.get("display_label", "?")
             pct   = round(float(sig.get("spend_share_pct", 0) or 0), 2)
-            lines.append(f"- {label}: {pct}% of spend")
+            tip   = sig.get("tip") or ""
+            if tip:
+                lines.append(f"- {label}: {pct}% of spend. Tip: {tip}")
+            else:
+                lines.append(f"- {label}: {pct}% of spend")
         lines.append("")
 
     # ── Tail instruction ──────────────────────────────────────────────────────

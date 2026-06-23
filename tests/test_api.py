@@ -171,3 +171,27 @@ def test_empty_csv_returns_422():
         headers={"X-Merchant-Token": VALID_TOKEN},
     )
     assert r.status_code == 422
+
+
+# ── Passion signal tip field ──────────────────────────────────────────────────
+
+def test_analyze_passion_insights_signals_have_tip():
+    """passion_insights.signals[] always contain a 'tip' str field (may be empty)."""
+    csv_bytes = _make_csv_bytes(n_rows=90)
+    r = client.post(
+        "/api/v1/insights/analyze",
+        files={"file": ("statement.csv", csv_bytes, "text/csv")},
+        headers={"X-Merchant-Token": VALID_TOKEN},
+    )
+    if r.status_code != 200:
+        pytest.skip(f"Pipeline returned {r.status_code}: {r.text[:200]}")
+    passion = r.json().get("passion_insights", {})
+    signals = passion.get("signals", [])
+    if not signals:
+        pytest.skip("No passion signals in this response — skipping tip field assertion.")
+    for sig in signals:
+        assert "tip" in sig, f"Passion signal missing 'tip' key: {sig}"
+        assert isinstance(sig["tip"], str), (
+            f"'tip' must be str, got {type(sig['tip'])!r}: {sig}"
+        )
+
